@@ -1,0 +1,10 @@
+{
+  "matching": {
+    "threshold_ft": 9,
+    "ambiguity_pct": 20
+  },
+  "paths": {
+    "backup": "backup/",
+    "reports": "reports/"
+  }
+}

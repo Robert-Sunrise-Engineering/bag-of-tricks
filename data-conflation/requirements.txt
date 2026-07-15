@@ -1,0 +1,4 @@
+arcgis>=2.1.0
+geopandas>=0.14.0
+pyproj>=3.6.0
+pandas>=2.0.0

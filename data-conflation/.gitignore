@@ -1,0 +1,15 @@
+# Local configuration with credentials
+config.local.json
+
+# Backup and reports
+backup/
+reports/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE files
+.vscode/
+.idea/
