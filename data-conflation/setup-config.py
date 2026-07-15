@@ -162,21 +162,14 @@ def main():
     print("-" * 40)
 
     captured_layer = validate_url(gis, captured_url, "Captured Layer")
-    if captured_layer is None:
-        # Allow continuing if at least one URL is valid, but check both before deciding
-        pass
-
     auth_layer = validate_url(gis, auth_url, "Authoritative Layer")
-    if auth_layer is None:
-        pass
 
-    if captured_layer is None and auth_layer is None:
-        print("\nBoth URLs are invalid. Aborting setup.")
+    if captured_layer is None or auth_layer is None:
+        print("\nOne or both URLs are invalid. Aborting setup.")
         sys.exit(1)
 
     # Step 5: Display layer info
-    if captured_layer is not None and auth_layer is not None:
-        display_layer_info(captured_layer, auth_layer)
+    display_layer_info(captured_layer, auth_layer)
 
     # Step 6: Write config
     print("\n" + "=" * 40)
