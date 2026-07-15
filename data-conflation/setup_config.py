@@ -5,6 +5,7 @@ import os
 import sys
 from getpass import getpass
 from arcgis.gis import GIS
+from arcgis.features import FeatureLayer
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,28 +36,25 @@ def validate_url(gis, url, label):
     while True:
         print(f"\nValidating {label}...")
         try:
-            layer = gis.content.get(url)
-            if layer is None:
+            layer = FeatureLayer(url=url, gis=gis)
+            layer_type = layer.properties.type
+            if layer_type != "Feature Layer":
                 print(f"URL does not point to a valid Feature Layer: {url}")
+                print(f"Found type: '{layer_type}'. Expected 'Feature Layer'.")
                 retry = input("Retry? [y/N]: ").strip().lower()
                 if retry == "y":
+                    url = prompt_url(f"{label} URL (FeatureServer/0 endpoint)")
                     continue
                 return None
-            if layer.type != "Feature Layer":
-                print(f"URL does not point to a valid Feature Layer: {url}")
-                print(f"Found type: '{layer.type}'. Expected 'Feature Layer'.")
-                retry = input("Retry? [y/N]: ").strip().lower()
-                if retry == "y":
-                    continue
-                return None
-            print(f"  Layer name: {layer.title}")
-            print(f"  Layer type: {layer.type}")
+            print(f"  Layer name: {layer.properties.name}")
+            print(f"  Layer type: {layer_type}")
             return layer
         except Exception as e:
             print(f"URL does not point to a valid Feature Layer: {url}")
             print(f"Error: {e}")
             retry = input("Retry? [y/N]: ").strip().lower()
             if retry == "y":
+                url = prompt_url(f"{label} URL (FeatureServer/0 endpoint)")
                 continue
             return None
 
@@ -64,13 +62,7 @@ def validate_url(gis, url, label):
 def get_feature_count(layer):
     """Get the feature count from a layer."""
     try:
-        return layer.item.itemInfo.attributes.get("Size", None) or layer.item.itemInfo.attributes.get("numFeatures", None)
-    except Exception:
-        pass
-
-    try:
-        features = layer.query(return_count_only=True)
-        return features
+        return layer.query(return_count_only=True)
     except Exception:
         return "unknown"
 
@@ -78,7 +70,7 @@ def get_feature_count(layer):
 def get_fields(layer):
     """Get field names from a layer."""
     try:
-        fields = layer.fields
+        fields = layer.properties.fields
         return [f.get("name", "") for f in fields if f.get("name")]
     except Exception:
         return []
@@ -91,14 +83,14 @@ def display_layer_info(captured_layer, auth_layer):
     print("=" * 40)
 
     print(f"\nCaptured Layer:")
-    print(f"  Name: {captured_layer.title}")
+    print(f"  Name: {captured_layer.properties.name}")
     count = get_feature_count(captured_layer)
     print(f"  Feature count: {count}")
     fields = get_fields(captured_layer)
     print(f"  Fields: {', '.join(fields)}")
 
     print(f"\nAuthoritative Layer:")
-    print(f"  Name: {auth_layer.title}")
+    print(f"  Name: {auth_layer.properties.name}")
     count = get_feature_count(auth_layer)
     print(f"  Feature count: {count}")
     fields = get_fields(auth_layer)
@@ -115,7 +107,8 @@ def write_config(username, password, captured_url, auth_url):
         "captured_layer_url": captured_url,
         "auth_layer_url": auth_url
     }
-    with open(CONFIG_LOCAL_PATH, "w") as f:
+    fd = os.open(CONFIG_LOCAL_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(config, f, indent=2)
     print(f"\nConfiguration written to {CONFIG_LOCAL_PATH}")
 
@@ -145,7 +138,7 @@ def main():
         # Try AGOL first, then allow custom portal
         print("  Connecting to arcgis.com (AGOL)...")
         gis = GIS(url="https://www.arcgis.com/sharing/rest", username=username, password=password)
-        print(f"  Authenticated as: {gis.properties.username}")
+        print(f"  Authenticated as: {gis.properties.user.username}")
     except Exception as e:
         print(f"Could not authenticate to AGOL. Please check your credentials.")
         print(f"Error: {e}")
