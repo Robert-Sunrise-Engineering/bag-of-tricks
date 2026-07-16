@@ -198,6 +198,8 @@ class TestConfigWriting:
         assert content["agol"]["password"] == "testpass123"
         assert "captured_layer_url" in content
         assert "auth_layer_url" in content
+        assert content["captured_layer_url"] == "https://example.com/services/Captured/FeatureServer/0"
+        assert content["auth_layer_url"] == "https://example.com/services/Auth/FeatureServer/0"
 
 
 class TestLayerInfoDisplay:
@@ -226,3 +228,62 @@ class TestLayerInfoDisplay:
         assert "ID" in output
         assert "Name" in output
         assert "Value" in output
+
+
+class TestRetryURLPropagation:
+    """Test that retry URLs are correctly propagated back to config."""
+
+    def test_captured_url_retry_propagated(self, gis_instance):
+        """Wrong captured URL -> retry with correct URL -> config has retry URL."""
+        wrong_url = "https://example.com/bad/FeatureServer/0"
+        correct_url = "https://example.com/good/FeatureServer/0"
+        captured_layer = make_mock_layer("Captured", 100, ["FieldA"])
+        auth_layer = make_mock_layer("Auth", 200, ["FieldB"])
+
+        with patch("builtins.input", side_effect=[
+            "user",
+            wrong_url,        # captured URL (wrong)
+            correct_url,      # auth URL (valid)
+            "y",              # retry captured?
+            correct_url,      # captured URL (retry, correct)
+        ]), \
+             patch("getpass.getpass", return_value="pass"), \
+             patch("arcgis.gis.GIS", return_value=gis_instance), \
+             patch("arcgis.features.FeatureLayer", side_effect=[
+                 Exception("bad"),     # captured_url fails
+                 captured_layer,       # retry captured_url succeeds
+                 auth_layer,           # auth_url succeeds
+             ]):
+            from setup_config import main
+            main()
+
+        content = json.loads(CONFIG_LOCAL_PATH.read_text())
+        assert content["captured_layer_url"] == correct_url
+
+    def test_auth_url_retry_propagated(self, gis_instance):
+        """Wrong auth URL -> retry with correct URL -> config has retry URL."""
+        correct_captured = "https://example.com/good/captured/FeatureServer/0"
+        wrong_url = "https://example.com/bad/FeatureServer/0"
+        correct_auth = "https://example.com/good/auth/FeatureServer/0"
+        captured_layer = make_mock_layer("Captured", 100, ["FieldA"])
+        auth_layer = make_mock_layer("Auth", 200, ["FieldB"])
+
+        with patch("builtins.input", side_effect=[
+            "user",
+            correct_captured,  # captured URL (valid)
+            wrong_url,         # auth URL (wrong)
+            "y",               # retry auth?
+            correct_auth,      # auth URL (retry, correct)
+        ]), \
+             patch("getpass.getpass", return_value="pass"), \
+             patch("arcgis.gis.GIS", return_value=gis_instance), \
+             patch("arcgis.features.FeatureLayer", side_effect=[
+                 captured_layer,       # captured_url succeeds
+                 Exception("bad"),     # auth_url fails
+                 auth_layer,           # retry auth_url succeeds
+             ]):
+            from setup_config import main
+            main()
+
+        content = json.loads(CONFIG_LOCAL_PATH.read_text())
+        assert content["auth_layer_url"] == correct_auth

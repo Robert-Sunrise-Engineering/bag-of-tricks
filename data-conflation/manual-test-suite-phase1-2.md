@@ -186,7 +186,23 @@ $config = Get-Content config.local.json | ConvertFrom-Json
 
 ---
 
-### Test 1.7: Wrong Layer Type [REMOVED — covered by pytest `test_wrong_layer_type_rejected`]
+### Test 1.7: Wrong Layer Type
+**Setup:** No existing `config.local.json`
+
+**Steps:**
+1. Run: `python setup_config.py`
+2. Enter valid credentials
+3. Enter a URL that points to a **non-Feature Layer** (e.g., Map Service, Table, or Web Map)
+4. When prompted `"Retry? [y/N]:"` → type `y`
+5. Enter a valid Feature Layer URL (captured)
+6. Enter another valid Feature Layer URL (auth)
+
+**Expected:**
+- First URL rejected with: `"Found type: '<type>'. Expected 'Feature Layer'."`
+- Retry prompts appear
+- Setup completes successfully after entering valid Feature Layer URLs
+
+---
 
 ### Test 1.8: Empty URL Handling
 **Setup:** No existing `config.local.json`
@@ -246,7 +262,6 @@ Get-Acl config.local.json | Format-List
 # Original content should still be intact
 $config = Get-Content config.local.json | ConvertFrom-Json
 # Compare with original values
-# If retry was used, verify the config contains the retry URL, not the original invalid URL
 ```
 
 ---
@@ -481,8 +496,17 @@ Get-Date -Format "yyyyMMdd_HHmmss"
 
 ---
 
-### Test 2.17: Layer Not Accessible [DEFERRED — Phase 3]
-**Status:** Deferred. The current `main()` does not fetch layers. The `get_layer_info()` function exists at `conflate.py:165` but is not called from `main()`. Layer fetching will be implemented in Phase 3 (Data Loading & CRS Handling).
+### Test 2.17: Layer Not Accessible
+**Setup:** Valid config, but layer URL is invalid/unreachable
+
+**Steps:**
+1. Modify `config.local.json` to point to a non-existent layer
+2. Run: `python conflate.py --layer "TestLayer"`
+
+**Expected:**
+- Output: `"Layer not found or not accessible: <url>"`
+- Error details printed
+- Script exits with code 1
 
 ---
 
@@ -513,8 +537,24 @@ Get-Date -Format "yyyyMMdd_HHmmss"
 
 ---
 
-### Test 2.20: Multiple Runs — Timestamp Uniqueness [DEFERRED — Phase 4]
-**Status:** Deferred. The current `main()` does not create backup files. Backup creation is implemented in Phase 4 (`create_backup()`). Timestamp uniqueness will be verified when the conflation workflow is added to `main()`.
+### Test 2.20: Multiple Runs — Timestamp Uniqueness
+**Setup:** Valid config
+
+**Steps:**
+1. Run: `python conflate.py --layer "TimestampTest" --apply`
+2. Wait 2 seconds
+3. Run: `python conflate.py --layer "TimestampTest" --apply`
+
+**Expected:**
+- Each run generates a unique timestamp
+- No file overwrites between runs
+- Backup files have distinct timestamps
+
+**Verification:**
+```powershell
+Get-ChildItem backup\TimestampTest_backup_*
+# Should show two files with different timestamps
+```
 
 ---
 
@@ -532,8 +572,9 @@ Run in this sequence for efficient credential reuse:
 | 5 | 1.3 | Overwrite accept | From Test 1.2 |
 | 6 | 1.5 | Both URLs invalid | Valid credentials |
 | 7 | 1.6 | One valid, one invalid | Valid credentials |
-| 8 | 1.9 | Config file permissions | From Test 1.1 |
-| 9 | 1.10 | Content preservation on failure | From Test 1.1 |
+| 8 | 1.7 | Wrong layer type | Valid credentials |
+| 9 | 1.9 | Config file permissions | From Test 1.1 |
+| 10 | 1.10 | Content preservation on failure | From Test 1.1 |
 
 ### Phase 2 (CLI)
 | # | Test | Purpose | Requires |
@@ -554,10 +595,10 @@ Run in this sequence for efficient credential reuse:
 | 14 | 2.14 | Default path resolution | From Test 2.3 |
 | 15 | 2.15 | Custom path resolution | Modify config.json |
 | 16 | 2.16 | No-trailing-slash paths | Modify config.json |
-| 17 | 2.17 | Layer not accessible [DEFERRED] | Modify config.local.json |
+| 17 | 2.17 | Layer not accessible | Modify config.local.json |
 | 18 | 2.18 | Auto-open flag | From Test 2.3 |
 | 19 | 2.19 | Special characters in layer name | From Test 2.3 |
-| 20 | 2.20 | Timestamp uniqueness [DEFERRED] | From Test 2.3 |
+| 20 | 2.20 | Timestamp uniqueness | From Test 2.3 |
 
 ---
 

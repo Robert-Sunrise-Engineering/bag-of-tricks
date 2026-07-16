@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 from getpass import getpass
 from arcgis.gis import GIS
@@ -32,7 +33,7 @@ def prompt_url(label):
 
 
 def validate_url(gis, url, label):
-    """Validate that a URL points to an accessible Feature Layer. Returns the layer or None."""
+    """Validate that a URL points to an accessible Feature Layer. Returns (layer, url) or (None, None)."""
     while True:
         print(f"\nValidating {label}...")
         try:
@@ -45,10 +46,10 @@ def validate_url(gis, url, label):
                 if retry == "y":
                     url = prompt_url(f"{label} URL (FeatureServer/0 endpoint)")
                     continue
-                return None
+                return None, None
             print(f"  Layer name: {layer.properties.name}")
             print(f"  Layer type: {layer_type}")
-            return layer
+            return layer, url
         except Exception as e:
             print(f"URL does not point to a valid Feature Layer: {url}")
             print(f"Error: {e}")
@@ -56,7 +57,7 @@ def validate_url(gis, url, label):
             if retry == "y":
                 url = prompt_url(f"{label} URL (FeatureServer/0 endpoint)")
                 continue
-            return None
+            return None, None
 
 
 def get_feature_count(layer):
@@ -107,9 +108,19 @@ def write_config(username, password, captured_url, auth_url):
         "captured_layer_url": captured_url,
         "auth_layer_url": auth_url
     }
-    fd = os.open(CONFIG_LOCAL_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(CONFIG_LOCAL_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
     with os.fdopen(fd, "w") as f:
         json.dump(config, f, indent=2)
+
+    # Remove inherited ACLs, grant full control to current user only (Windows)
+    try:
+        subprocess.run(
+            ["icacls", CONFIG_LOCAL_PATH, "/inheritance:r", f'/grant:r "%USERNAME%":(F)'],
+            check=True, capture_output=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
     print(f"\nConfiguration written to {CONFIG_LOCAL_PATH}")
 
 
@@ -154,8 +165,8 @@ def main():
     print("\nStep 4: Validating Layers")
     print("-" * 40)
 
-    captured_layer = validate_url(gis, captured_url, "Captured Layer")
-    auth_layer = validate_url(gis, auth_url, "Authoritative Layer")
+    captured_layer, captured_url = validate_url(gis, captured_url, "Captured Layer")
+    auth_layer, auth_url = validate_url(gis, auth_url, "Authoritative Layer")
 
     if captured_layer is None or auth_layer is None:
         print("\nOne or both URLs are invalid. Aborting setup.")
