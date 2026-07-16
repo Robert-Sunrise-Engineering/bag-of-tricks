@@ -6,13 +6,18 @@ producing a review file for manual verification before applying changes.
 
 import argparse
 import json
+import logging
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import geopandas as gpd
+import numpy as np
+import pandas as pd
 from arcgis.features import FeatureLayer
 from arcgis.gis import GIS
+from pyproj import CRS
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +266,227 @@ def resolve_paths(config, layer_name):
 
 
 # ---------------------------------------------------------------------------
-# Main Entry Point
+# Data Loading & CRS Handling
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def load_layer_as_gdf(gis, layer_url, layer_info):
+    """Load an AGOL feature layer as a GeoDataFrame.
+
+    Args:
+        gis: Authenticated GIS object.
+        layer_url: Full URL to the layer's FeatureServer/0 endpoint.
+        layer_info: Dict with layer metadata (keys: layer_name, fields).
+
+    Returns:
+        tuple: (geopandas.GeoDataFrame, skipped_count)
+            Null/empty geometries are skipped. Empty layers return an empty
+            GeoDataFrame with preserved schema. Output is in WGS 84 (EPSG:4326).
+    """
+    layer_name = layer_info["layer_name"]
+    feature_layer = FeatureLayer(url=layer_url, gis=gis)
+
+    # Query all features (without as_df to avoid spatial accessor issues)
+    try:
+        feature_set = feature_layer.query(as_df=False)
+    except Exception as e:
+        logger.error(f"Failed to query layer {layer_name}: {e}")
+        raise
+
+    # Convert FeatureSet to GeoDataFrame
+    if not feature_set.features:
+        logger.warning(f"Layer {layer_name} has no features with valid geometry")
+        empty_gdf = gpd.GeoDataFrame(geometry=[])
+        empty_gdf = empty_gdf.set_crs("EPSG:4326")
+        return empty_gdf, 0
+
+    # Detect source CRS from first feature's spatialReference
+    first_geom = feature_set.features[0].geometry
+    source_crs = None
+    if first_geom and "spatialReference" in first_geom:
+        sr = first_geom["spatialReference"]
+        wkid = sr.get("wkid") or sr.get("latestWkid")
+        if wkid:
+            source_crs = f"EPSG:{wkid}"
+
+    # Build records list with geometry handling
+    records = []
+    skipped_count = 0
+
+    for feature in feature_set.features:
+        geom = feature.geometry
+
+        if geom is None:
+            oid_val = feature.attributes.get("OBJECTID", "unknown")
+            logger.warning(f"Skipping record OBJECTID={oid_val}: null/empty geometry")
+            skipped_count += 1
+            continue
+
+        # Check if geometry is empty (no x/y or empty coords)
+        if not isinstance(geom, dict):
+            try:
+                if hasattr(geom, "is_empty") and geom.is_empty:
+                    oid_val = feature.attributes.get("OBJECTID", "unknown")
+                    logger.warning(f"Skipping record OBJECTID={oid_val}: null/empty geometry")
+                    skipped_count += 1
+                    continue
+            except Exception:
+                pass
+            records.append({**feature.attributes, "Shape": geom})
+            continue
+
+        x = geom.get("x")
+        y = geom.get("y")
+        if x is None or y is None:
+            oid_val = feature.attributes.get("OBJECTID", "unknown")
+            logger.warning(f"Skipping record OBJECTID={oid_val}: null/empty geometry")
+            skipped_count += 1
+            continue
+
+        from shapely.geometry import Point
+        records.append({**feature.attributes, "Shape": Point(x, y)})
+
+    if not records:
+        logger.warning(f"Layer {layer_name} has no features with valid geometry")
+        empty_gdf = gpd.GeoDataFrame(geometry=[])
+        empty_gdf = empty_gdf.set_crs("EPSG:4326")
+        return empty_gdf, skipped_count
+
+    # Create GeoDataFrame with detected source CRS
+    gdf = gpd.GeoDataFrame(records, geometry="Shape")
+    if source_crs:
+        gdf = gdf.set_crs(source_crs)
+    else:
+        gdf = gdf.set_crs("EPSG:4326")
+
+    # Reproject to WGS 84 if not already
+    if gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    return gdf, skipped_count
+
+
+def pd_dtype_empty(series):
+    """Return an empty array-like with the same dtype as the series."""
+    if series.dtype.name.startswith("datetime"):
+        return pd.to_datetime([])
+    elif series.dtype.name == "int64" or series.dtype.name == "int32":
+        return pd.Series([], dtype=series.dtype)
+    elif series.dtype.name == "float64" or series.dtype.name == "float32":
+        return pd.Series([], dtype=series.dtype)
+    else:
+        return pd.Series([], dtype="object")
+
+
+def detect_utm_zone(gdf):
+    """Detect the UTM zone EPSG code from a GeoDataFrame's centroid.
+
+    Args:
+        gdf: GeoDataFrame with geometries in WGS 84 (EPSG:4326).
+
+    Returns:
+        int: EPSG code for the UTM zone (326xx for northern, 327xx for southern).
+    """
+    centroid = gdf.geometry.union_all().centroid
+    centroid_lon = centroid.x
+    centroid_lat = centroid.y
+
+    zone = int(np.floor((centroid_lon + 180) / 6)) + 1
+
+    if centroid_lat >= 0:
+        epsg = 32600 + zone
+    else:
+        epsg = 32700 + zone
+
+    return epsg
+
+
+def reproject_to_utm(gdf, epsg_code):
+    """Reproject a GeoDataFrame to UTM.
+
+    Args:
+        gdf: GeoDataFrame in WGS 84 (EPSG:4326).
+        epsg_code: Target UTM EPSG code.
+
+    Returns:
+        GeoDataFrame reprojected to the target CRS.
+        If empty, returns the GeoDataFrame unchanged.
+    """
+    if gdf.empty:
+        return gdf
+
+    target_crs = CRS.from_epsg(epsg_code)
+    return gdf.to_crs(target_crs)
+
+
+def prepare_data(gis, captured_url, auth_url, captured_info, auth_info):
+    """Load both layers and prepare for spatial processing.
+
+    Loads captured and authoritative layers as GeoDataFrames, detects
+    the UTM zone from the authoritative layer's centroid, and creates
+    transient UTM-reprojected copies for spatial indexing and distance
+    calculations.
+
+    Args:
+        gis: Authenticated GIS object.
+        captured_url: URL of the captured (source) layer.
+        auth_url: URL of the authoritative (destination) layer.
+        captured_info: Dict with captured layer metadata.
+        auth_info: Dict with authoritative layer metadata.
+
+    Returns:
+        dict with keys:
+            captured_wgs84 — GeoDataFrame in WGS 84 (for output)
+            auth_wgs84 — GeoDataFrame in WGS 84 (for output)
+            captured_utm — GeoDataFrame in UTM (for spatial work)
+            auth_utm — GeoDataFrame in UTM (for spatial work)
+            utm_epsg — the detected EPSG code
+    """
+    # Load both layers in WGS 84
+    captured_wgs84, captured_skipped = load_layer_as_gdf(gis, captured_url, captured_info)
+    auth_wgs84, auth_skipped = load_layer_as_gdf(gis, auth_url, auth_info)
+
+    logger.info(
+        f"Loaded {len(captured_wgs84)} features from {captured_info['layer_name']}"
+    )
+    logger.info(
+        f"Loaded {len(auth_wgs84)} features from {auth_info['layer_name']}"
+    )
+    if captured_skipped > 0:
+        logger.warning(
+            f"Skipped {captured_skipped} records with null/empty geometry from {captured_info['layer_name']}"
+        )
+    if auth_skipped > 0:
+        logger.warning(
+            f"Skipped {auth_skipped} records with null/empty geometry from {auth_info['layer_name']}"
+        )
+
+    # Detect UTM zone from authoritative layer
+    if auth_wgs84.empty:
+        # Fallback: use captured layer if auth is empty
+        if not captured_wgs84.empty:
+            utm_epsg = detect_utm_zone(captured_wgs84)
+        else:
+            # Both empty — default to a reasonable EPSG
+            utm_epsg = 32618  # UTM 18N (New York default)
+    else:
+        utm_epsg = detect_utm_zone(auth_wgs84)
+
+    logger.info(f"Detected UTM zone: EPSG:{utm_epsg}")
+
+    # Create UTM-reprojected copies
+    captured_utm = reproject_to_utm(captured_wgs84, utm_epsg)
+    auth_utm = reproject_to_utm(auth_wgs84, utm_epsg)
+
+    return {
+        "captured_wgs84": captured_wgs84,
+        "auth_wgs84": auth_wgs84,
+        "captured_utm": captured_utm,
+        "auth_utm": auth_utm,
+        "utm_epsg": utm_epsg,
+    }
 
 def main(argv=None):
     """Main entry point for the conflation tool."""

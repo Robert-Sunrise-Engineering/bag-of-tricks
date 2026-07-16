@@ -1,13 +1,14 @@
-# Manual Test Suite — Phase 1 & 2 Combined
+# Manual Test Suite — Phase 1, 2 & 3
 
 ## Prerequisites
 
 Before running any tests, ensure:
 
-1. **Python environment** — Python 3.9+ installed with dependencies from `requirements.txt`
+1. **Python environment** — Python 3.9+ installed with dependencies from `requirements.txt` (includes `geopandas`, `pyproj`)
 2. **AGOL credentials** — Valid username/password for `arcgis.com`
 3. **Two Feature Layer URLs** — Full `FeatureServer/0` endpoints (can use the same layer tested twice, or two different ones)
 4. **Clean workspace** — No existing `config.local.json` for Phase 1 tests; no leftover backups for Phase 2 tests
+5. **Layers with valid geometries** — For Phase 3 tests, at least one layer must have features with valid (non-null) geometries
 
 ---
 
@@ -481,8 +482,8 @@ Get-Date -Format "yyyyMMdd_HHmmss"
 
 ---
 
-### Test 2.17: Layer Not Accessible [DEFERRED — Phase 3]
-**Status:** Deferred. The current `main()` does not fetch layers. The `get_layer_info()` function exists at `conflate.py:165` but is not called from `main()`. Layer fetching will be implemented in Phase 3 (Data Loading & CRS Handling).
+### Test 2.17: Layer Not Accessible [SUPERSEDED — Phase 3]
+**Status:** Superseded. The layer loading tests in Part C (Phase 3) cover this functionality. See tests 3.1–3.3 for data loading behavior.
 
 ---
 
@@ -515,6 +516,140 @@ Get-Date -Format "yyyyMMdd_HHmmss"
 
 ### Test 2.20: Multiple Runs — Timestamp Uniqueness [DEFERRED — Phase 4]
 **Status:** Deferred. The current `main()` does not create backup files. Backup creation is implemented in Phase 4 (`create_backup()`). Timestamp uniqueness will be verified when the conflation workflow is added to `main()`.
+
+---
+
+## Part C: Phase 3 — Data Loading & CRS Handling (`conflate.py`)
+
+### Prerequisites for Phase 3 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds and paths)
+- Layers referenced in config must have features with valid geometries (at least one layer)
+- Python environment must have `geopandas`, `pyproj` installed
+
+---
+
+### Test 3.1: Load Layer — Happy Path
+**Setup:** Valid config, layer with known features
+
+**Steps:**
+1. Run: `python conflate.py --layer "TestLayer"` (dry run, but data loads)
+2. Check log output for feature counts
+
+**Expected:**
+- Log: `"Loaded <n> features from <layer_name>"`
+- Layer loads as GeoDataFrame with all attribute fields (OBJECTID, GlobalID, etc.)
+- CRS is EPSG:4326 (WGS 84)
+- Geometry column contains valid geometries
+- Feature count matches AGOL feature count
+
+---
+
+### Test 3.2: Load Layer — Null/Empty Geometries Skipped
+**Setup:** A layer known to have some records with null/empty geometries (or create a test layer)
+
+**Steps:**
+1. Run conflation with the layer
+2. Check log output
+
+**Expected:**
+- Records with null/empty geometries are excluded from the GeoDataFrame
+- Warning logged for each skipped record: `"Skipping record OBJECTID=<id>: null/empty geometry"`
+- Summary warning: `"Skipped <n> records with null/empty geometry from <layer_name>"`
+
+---
+
+### Test 3.3: Load Layer — Empty Layer
+**Setup:** An empty feature layer (0 features) or a layer where all geometries are null
+
+**Steps:**
+1. Run conflation targeting the empty layer
+
+**Expected:**
+- Empty GeoDataFrame returned (no crash)
+- Warning logged: `"Layer <name> has no features with valid geometry"`
+
+---
+
+### Test 3.4: UTM Zone Detection — Northern Hemisphere
+**Setup:** Valid config, layer in a known northern location
+
+**Steps:**
+1. Run conflation with a layer in a known northern location (e.g., New York area)
+2. Check log output for UTM zone detection
+
+**Expected:**
+- Log contains: `"Detected UTM zone: EPSG:32618"` (for NYC-area)
+- UTM coordinates are in meters, not degrees
+
+---
+
+### Test 3.5: UTM Zone Detection — Southern Hemisphere
+**Setup:** Valid config, layer in a known southern location
+
+**Steps:**
+1. Run conflation with a layer in a known southern location (e.g., Sydney, Australia area)
+2. Check log output for UTM zone detection
+
+**Expected:**
+- Log contains: `"Detected UTM zone: EPSG:32756"` (for Sydney-area)
+- Southern hemisphere uses 327xx EPSG codes
+
+---
+
+### Test 3.6: CRS Reprojection — Meter Verification
+**Setup:** Valid config, any layer with features
+
+**Steps:**
+1. Run conflation
+2. After UTM reprojection, verify coordinates are in meters (not degrees)
+
+**Expected:**
+- Reprojected coordinates are large numbers (meters from origin), not small decimal values (degrees)
+- For a NYC-area layer: X coordinate should be ~500,000+ meters, Y should be ~4,500,000+ meters
+
+---
+
+### Test 3.7: Full `prepare_data()` Workflow
+**Setup:** Valid config with two different layers (captured and authoritative)
+
+**Steps:**
+1. Run conflation with both layers having valid data
+2. Check log output and verify both layers loaded
+
+**Expected:**
+- Log: `"Loaded <n> features from <captured_layer_name>"`
+- Log: `"Loaded <n> features from <auth_layer_name>"`
+- Log: `"Detected UTM zone: EPSG:<code>"`
+- Both layers loaded in WGS 84 AND UTM
+- WGS 84 GeoDataFrames retain original degree coordinates
+- UTM GeoDataFrames have meter coordinates
+
+---
+
+### Test 3.8: Empty Auth Layer Fallback
+**Setup:** Valid config where authoritative layer is empty but captured layer has data
+
+**Steps:**
+1. Run conflation
+
+**Expected:**
+- UTM zone detected from captured layer (fallback)
+- Both GeoDataFrames created without error
+- No crash or exception
+
+---
+
+### Test 3.9: Both Layers Empty
+**Setup:** Valid config where both layers are empty
+
+**Steps:**
+1. Run conflation
+
+**Expected:**
+- Defaults to EPSG:32618 (UTM 18N)
+- Both empty GeoDataFrames created
+- No crash or exception
 
 ---
 
@@ -554,10 +689,23 @@ Run in this sequence for efficient credential reuse:
 | 14 | 2.14 | Default path resolution | From Test 2.3 |
 | 15 | 2.15 | Custom path resolution | Modify config.json |
 | 16 | 2.16 | No-trailing-slash paths | Modify config.json |
-| 17 | 2.17 | Layer not accessible [DEFERRED] | Modify config.local.json |
+| 17 | 2.17 | Layer not accessible [SUPERSEDED] | See Phase 3 tests |
 | 18 | 2.18 | Auto-open flag | From Test 2.3 |
 | 19 | 2.19 | Special characters in layer name | From Test 2.3 |
 | 20 | 2.20 | Timestamp uniqueness [DEFERRED] | From Test 2.3 |
+
+### Phase 3 (Data Loading & CRS)
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 3.2 | Null geometry skipping (quick fail) | Layer with null geoms |
+| 2 | 3.3 | Empty layer handling | Empty layer |
+| 3 | 3.1 | **Happy path** (full data load) | Valid layer with data |
+| 4 | 3.4 | UTM detection — northern | Northern hemisphere layer |
+| 5 | 3.5 | UTM detection — southern | Southern hemisphere layer |
+| 6 | 3.6 | Meter coordinate verification | Any layer with data |
+| 7 | 3.7 | Full workflow (both layers) | Two valid layers |
+| 8 | 3.8 | Empty auth fallback | Empty auth layer |
+| 9 | 3.9 | Both empty fallback | Both layers empty |
 
 ---
 
@@ -604,4 +752,18 @@ Remove-Item reports\* -Force
 | 2.7–2.10 | Missing/invalid config | `--layer "X"` |
 | 2.11–2.13 | Bad/missing creds | `--layer "X"` |
 | 2.15–2.16 | Modified config.json | `--layer "X"` |
-| 2.17 | Invalid layer URL | `--layer "X"` |
+| 2.17 | Superseded | See Phase 3 |
+
+### Phase 3
+
+| Test | Layer State | What to Check |
+|------|------------|---------------|
+| 3.1 | Valid data | GeoDataFrame structure, fields, CRS |
+| 3.2 | Has null geoms | Skip warnings in logs |
+| 3.3 | Empty layer | Graceful empty GDF |
+| 3.4 | Northern location | EPSG 326xx in logs |
+| 3.5 | Southern location | EPSG 327xx in logs |
+| 3.6 | Any data | Meter-scale coordinates |
+| 3.7 | Two valid layers | Full pipeline, WGS84 + UTM |
+| 3.8 | Empty auth | Fallback UTM detection |
+| 3.9 | Both empty | Default EPSG:32618 |
