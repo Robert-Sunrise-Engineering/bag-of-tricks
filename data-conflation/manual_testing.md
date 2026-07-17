@@ -1,4 +1,4 @@
-# Manual Test Suite — Phase 1, 2 & 3
+# Manual Test Suite — Phases 1–6 ✅ **COMPLETE**
 
 ## Prerequisites
 
@@ -1247,6 +1247,253 @@ Matching complete: <c> clean, <a> ambiguous, <n> new
 
 ---
 
+## Part F: Phase 6 — Global Collision Resolution (`conflate.py`) ✅ **DONE**
+
+### Prerequisites for Phase 6 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds and paths)
+- Layers referenced in config must have features with valid geometries
+- Python environment must have `geopandas`, `pyproj` installed
+- Phase 5 tests must pass (spatial indexing and matching working)
+- Need at least one case where multiple captured points match the same auth point
+
+---
+
+### Test 6.1: Collision Detected and Resolved (Happy Path)
+**Setup:** Valid config, both layers with data where at least two captured points match the same auth point within threshold
+
+**Steps:**
+1. Run: `python conflate.py --layer "CollisionTest"` (dry run)
+2. Verify console output shows collision detection and resolution
+
+**Expected output:**
+```
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: clean (d1=<x>.<y> ft, d2=<x>.<y> ft)
+...
+INFO: Collision detected: auth GlobalID <gid> claimed by captured OBJECTID <oid1> (d=<d1> ft) and captured OBJECTID <oid2> (d=<d2> ft)
+  -> OBJECTID <closest_oid> retains match (closest)
+  -> OBJECTID <farther_oid> reclassified as new
+Detecting collisions...
+Resolving <n> collision(s)...
+After collision resolution: <c> clean, <a> ambiguous, <n> new
+```
+
+**Verification:**
+- Collision log message present with correct GlobalID
+- Closest captured point retains its match
+- Farther captured point reclassified as "new"
+- Post-resolution summary shows updated counts (one fewer clean/ambiguous, one more new)
+
+---
+
+### Test 6.2: No Collisions Detected
+**Setup:** Valid config, both layers with data where each captured point matches a unique auth point (one-to-one mapping)
+
+**Steps:**
+1. Run: `python conflate.py --layer "NoCollisionTest"` (dry run)
+2. Verify console output shows no collisions
+
+**Expected output:**
+```
+Matching complete: <n> clean, <a> ambiguous, <m> new
+Detecting collisions...
+No collisions detected.
+```
+
+**Verification:**
+- "No collisions detected." message present
+- No collision resolution messages
+- Summary unchanged from Phase 5
+
+---
+
+### Test 6.3: Multiple Separate Collisions
+**Setup:** Valid config, data where multiple distinct auth points are each claimed by multiple captured points
+
+**Steps:**
+1. Run: `python conflate.py --layer "MultipleCollisionsTest"` (dry run)
+2. Verify all collisions are detected and resolved
+
+**Expected output:**
+```
+INFO: Collision detected: auth GlobalID <gid1> claimed by captured OBJECTID <...> and captured OBJECTID <...>
+  -> OBJECTID <winner1> retains match (closest)
+  -> OBJECTID <loser1> reclassified as new
+INFO: Collision detected: auth GlobalID <gid2> claimed by captured OBJECTID <...> and captured OBJECTID <...>
+  -> OBJECTID <winner2> retains match (closest)
+  -> OBJECTID <loser2> reclassified as new
+Resolving 2 collision(s)...
+```
+
+**Verification:**
+- Each collision logged separately with its own GlobalID
+- Each winner retains match, each loser reclassified
+- Total collision count matches number of logged collisions
+
+---
+
+### Test 6.4: Tie-Breaking by Lower OBJECTID
+**Setup:** Valid config, two captured points at approximately the same distance from the same auth point
+
+**Steps:**
+1. Run: `python conflate.py --layer "TieBreakTest"` (dry run)
+2. Verify the lower OBJECTID wins the tie
+
+**Expected output:**
+```
+INFO: Collision detected: auth GlobalID <gid> claimed by captured OBJECTID <low_oid> (d=<d> ft) and captured OBJECTID <high_oid> (d=<d> ft)
+  -> OBJECTID <low_oid> retains match (closest)
+  -> OBJECTID <high_oid> reclassified as new
+```
+
+**Verification:**
+- Lower OBJECTID retains the match despite equal distances
+- Higher OBJECTID reclassified as new
+
+---
+
+### Test 6.5: Three or More Claimants
+**Setup:** Valid config, data where three or more captured points match the same auth point
+
+**Steps:**
+1. Run: `python conflate.py --layer "ThreeClaimantsTest"` (dry run)
+2. Verify closest wins and all others reclassified
+
+**Expected output:**
+```
+INFO: Collision detected: auth GlobalID <gid> claimed by captured OBJECTID <oid1> (d=<d1> ft), captured OBJECTID <oid2> (d=<d2> ft), and captured OBJECTID <oid3> (d=<d3> ft)
+  -> OBJECTID <closest_oid> retains match (closest)
+  -> OBJECTID <loser1> reclassified as new
+  -> OBJECTID <loser2> reclassified as new
+```
+
+**Verification:**
+- Closest captured point retains match
+- Both other captured points reclassified as "new"
+- Only one winner per collision group
+
+---
+
+### Test 6.6: All-New Results (No Collisions Possible)
+**Setup:** Valid config, authoritative layer is empty or all captured points are beyond threshold
+
+**Steps:**
+1. Run: `python conflate.py --layer "AllNewTest"` (dry run)
+2. Verify no collision detection errors
+
+**Expected output:**
+```
+Matching complete: 0 clean, 0 ambiguous, <n> new
+Detecting collisions...
+No collisions detected.
+```
+
+**Verification:**
+- No collision detection errors
+- All captured points remain "new"
+- "No collisions detected." message present
+
+---
+
+### Test 6.7: Full Flow Through Phase 6
+**Setup:** Valid config, both layers with data including at least one collision scenario
+
+**Steps:**
+1. Run: `python conflate.py --layer "FullFlowPhase6"` (dry run)
+2. Capture all output from Phase 4 through Phase 6
+
+**Expected output sequence:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: FullFlowPhase6
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/FullFlowPhase6_backup_<YYYYMMDD_HHMMSS>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: <type> (d1=<x>.<y> ft, d2=<x>.<y> ft)
+...
+Matching complete: <c> clean, <a> ambiguous, <n> new
+Detecting collisions...
+INFO: Collision detected: auth GlobalID <gid> claimed by captured OBJECTID <...> and captured OBJECTID <...>
+  -> OBJECTID <winner> retains match (closest)
+  -> OBJECTID <loser> reclassified as new
+Resolving 1 collision(s)...
+After collision resolution: <c'> clean, <a'> ambiguous, <n'> new
+```
+
+**Verification:**
+- All Phase 4 lines present in correct order
+- Phase 5 matching and summary present
+- Phase 6 collision detection and resolution present
+- Post-resolution summary shows updated counts (losers moved from clean/ambiguous to new)
+
+---
+
+### Test 6.8: Logging Output Verification
+**Setup:** Valid config, data with known collision scenario
+
+**Steps:**
+1. Run: `python conflate.py --layer "LoggingTest"` (dry run)
+2. Capture console output
+3. Verify collision log format
+
+**Expected log format:**
+```
+Collision detected: auth GlobalID <globalid> claimed by captured OBJECTID <oid1> (d=<d1> ft) and captured OBJECTID <oid2> (d=<d2> ft)
+  -> OBJECTID <winner_oid> retains match (closest)
+  -> OBJECTID <loser_oid> reclassified as new
+```
+
+**Verification:**
+- Collision message includes GlobalID of claimed auth point
+- All claimants listed with distances
+- Winner clearly identified as "retains match (closest)"
+- Losers clearly identified as "reclassified as new"
+- Arrow format (`->`) used consistently
+
+---
+
+### Test 6.9: Post-Resolution Match Consistency
+**Setup:** Valid config, data with collision scenario
+
+**Steps:**
+1. Run: `python conflate.py --layer "ConsistencyTest"` (dry run)
+2. Verify that reclassified "new" records have consistent fields
+
+**Verification (via inspection of code/logic):**
+- All reclassified "new" records have `auth_globalid = None`
+- All reclassified "new" records have `auth_objectid = None`
+- All reclassified "new" records have `auth_geom_wgs84 = None`
+- All reclassified "new" records have `distance_ft = None`
+- Winners retain all their original match fields
+
+---
+
+### Phase 6 (Global Collision Resolution)
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 6.2 | No collisions (quick pass) | One-to-one matching |
+| 2 | 6.6 | All-new results | Empty auth or all distant |
+| 3 | 6.1 | **Collision detected and resolved** | Multi-captured, same auth |
+| 4 | 6.3 | Multiple separate collisions | Multiple collision groups |
+| 5 | 6.4 | Tie-breaking by OBJECTID | Equal-distance claimants |
+| 6 | 6.5 | Three or more claimants | 3+ captured, same auth |
+| 7 | 6.7 | **Full flow** | Valid config, collision scenario |
+| 8 | 6.8 | Logging output verification | Collision scenario |
+| 9 | 6.9 | Post-resolution consistency | Collision scenario |
+
+---
+
 ## Cleanup
 
 After all tests pass:
@@ -1308,6 +1555,20 @@ Remove-Item backup\*checkpoint*.json -Force
 | 3.7 | Two valid layers | Full pipeline, WGS84 + UTM |
 | 3.8 | Empty auth | Fallback UTM detection |
 | 3.9 | Both empty | Default EPSG:32618 |
+
+### Phase 6
+
+| Test | Layer State | What to Check |
+|------|------------|---------------|
+| 6.1 | Collision scenario | Collision logged, winner retains, loser reclassified |
+| 6.2 | One-to-one matching | "No collisions detected." |
+| 6.3 | Multiple collision groups | All collisions resolved |
+| 6.4 | Equal-distance claimants | Lower OBJECTID wins |
+| 6.5 | 3+ claimants | Closest wins, all others reclassified |
+| 6.6 | All-new results | No collision errors |
+| 6.7 | Full flow with collision | Complete output sequence |
+| 6.8 | Collision scenario | Log format correct |
+| 6.9 | Collision scenario | Reclassified records consistent |
 
 ### Phase 4
 

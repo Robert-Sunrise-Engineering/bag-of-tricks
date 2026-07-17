@@ -749,6 +749,102 @@ def match_points(captured_utm, auth_utm, spatial_index, threshold_ft, ambiguity_
     return results
 
 
+def detect_collisions(match_results):
+    """Detect cases where multiple captured points claim the same authoritative point.
+
+    Groups match results by auth_globalid and identifies many-to-one conflicts
+    where multiple captured points matched to the same authoritative record.
+
+    Args:
+        match_results: List of match result dicts from match_points().
+
+    Returns:
+        Dict mapping auth_globalid to list of conflicting match result dicts.
+        Empty dict if no collisions detected.
+    """
+    # Group matched results by auth_globalid
+    auth_groups = {}
+    for result in match_results:
+        if result["match_type"] == "new":
+            continue
+        auth_gid = result.get("auth_globalid")
+        if auth_gid is None:
+            continue
+        if auth_gid not in auth_groups:
+            auth_groups[auth_gid] = []
+        auth_groups[auth_gid].append(result)
+
+    # Filter to only groups with multiple claimants (actual collisions)
+    collisions = {
+        auth_gid: results
+        for auth_gid, results in auth_groups.items()
+        if len(results) > 1
+    }
+
+    return collisions
+
+
+def resolve_collisions(match_results, collisions):
+    """Resolve many-to-one collisions by keeping the closest captured point.
+
+    For each collision group, the captured point with the smallest distance_ft
+    wins. All other captured points are reclassified as "new".
+
+    Args:
+        match_results: List of match result dicts from match_points().
+        collisions: Dict mapping auth_globalid to list of conflicting results.
+
+    Returns:
+        Updated list of match results with collisions resolved.
+    """
+    # Build a lookup from captured_objectid to result index
+    oid_to_idx = {}
+    for i, result in enumerate(match_results):
+        oid_to_idx[result["captured_objectid"]] = i
+
+    for auth_gid, claimants in collisions.items():
+        # Log the collision
+        claimant_strs = []
+        for c in claimants:
+            claimant_strs.append(
+                f"captured OBJECTID {c['captured_objectid']} (d={c['distance_ft']:.1f} ft)"
+            )
+        logger.info(
+            f"Collision detected: auth GlobalID {auth_gid} claimed by "
+            f"{' and '.join(claimant_strs)}"
+        )
+
+        # Sort by distance_ft ascending; tie-break by lower captured_objectid
+        claimants.sort(key=lambda r: (r["distance_ft"] if r["distance_ft"] is not None else float("inf"), r["captured_objectid"]))
+
+        winner = claimants[0]
+        winners = claimants[1:]
+
+        # Log winner
+        logger.info(
+            f"  -> OBJECTID {winner['captured_objectid']} retains match (closest)"
+        )
+
+        # Add collision metadata to winner
+        winner["collision_wins"] = len(claimants)
+        winner["collision_resolved"] = True
+
+        # Reclassify losers as "new"
+        for loser in winners:
+            loser["match_type"] = "new"
+            loser["auth_globalid"] = None
+            loser["auth_objectid"] = None
+            loser["auth_geom_wgs84"] = None
+            loser["distance_ft"] = None
+            loser["collision_distance_ft"] = loser.get("d1")
+
+            logger.info(
+                f"  -> OBJECTID {loser['captured_objectid']} reclassified as new"
+            )
+
+    return match_results
+
+
 def load_checkpoint(checkpoint_path):
     """Load a checkpoint file.
 
@@ -929,6 +1025,20 @@ def main(argv=None):
     ambiguous = sum(1 for r in match_results if r["match_type"] == "ambiguous")
     new = sum(1 for r in match_results if r["match_type"] == "new")
     print(f"Matching complete: {clean} clean, {ambiguous} ambiguous, {new} new")
+
+    # Phase 6: Collision Resolution
+    print("Detecting collisions...")
+    collisions = detect_collisions(match_results)
+    if collisions:
+        print(f"Resolving {len(collisions)} collision(s)...")
+        match_results = resolve_collisions(match_results, collisions)
+        # Update summary after collision resolution
+        clean = sum(1 for r in match_results if r["match_type"] == "clean")
+        ambiguous = sum(1 for r in match_results if r["match_type"] == "ambiguous")
+        new = sum(1 for r in match_results if r["match_type"] == "new")
+        print(f"After collision resolution: {clean} clean, {ambiguous} ambiguous, {new} new")
+    else:
+        print("No collisions detected.")
 
 
 if __name__ == "__main__":
