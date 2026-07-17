@@ -514,8 +514,8 @@ Get-Date -Format "yyyyMMdd_HHmmss"
 
 ---
 
-### Test 2.20: Multiple Runs — Timestamp Uniqueness [DEFERRED — Phase 4]
-**Status:** Deferred. The current `main()` does not create backup files. Backup creation is implemented in Phase 4 (`create_backup()`). Timestamp uniqueness will be verified when the conflation workflow is added to `main()`.
+### Test 2.20: Multiple Runs — Timestamp Uniqueness
+**Status:** Moved to Part D (Test 4.8). Backup creation is now implemented in Phase 4.
 
 ---
 
@@ -709,6 +709,544 @@ Run in this sequence for efficient credential reuse:
 
 ---
 
+## Part D: Phase 4 — Schema Validation & Backup (`conflate.py`)
+
+### Prerequisites for Phase 4 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds and paths)
+- Layers referenced in config must have a `notes` field (for validation tests)
+- `backup/` directory should be clean (no leftover backup files)
+- Python environment must have `geopandas`, `pyproj` installed
+
+---
+
+### Test 4.1: Schema Validation — Happy Path
+**Setup:** Valid config, authoritative layer has a `notes` field
+
+**Steps:**
+1. Run: `python conflate.py --layer "TestLayer"` (dry run)
+
+**Expected output:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: TestLayer
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/<Layer>_backup_<YYYYMMDD_HHMMSS>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+```
+
+**Verification:**
+```powershell
+# Check backup file exists
+Test-Path backup\<Layer>_backup_*.gpkg  # should be True
+```
+
+---
+
+### Test 4.2: Schema Validation — Missing Notes Field
+**Setup:** Valid config, authoritative layer without a `notes` field (create a test layer or use one that lacks it)
+
+**Steps:**
+1. Run: `python conflate.py --layer "NoNotesLayer"`
+
+**Expected:**
+- Output: `"FATAL: Authoritative layer 'NoNotesLayer' is missing the required 'notes' field. Aborting."`
+- Script exits with code 1
+- No backup file is created
+
+**Verification:**
+```powershell
+# No new backup files should exist
+Get-ChildItem backup\NoNotesLayer_backup_*  # should return nothing
+```
+
+---
+
+### Test 4.3: Backup File Verification
+**Setup:** Valid config, layer with `notes` field and data
+
+**Steps:**
+1. Run: `python conflate.py --layer "VerifyBackup"` (dry run)
+2. Find the most recent backup file
+3. Verify the backup with Python:
+
+```python
+import geopandas as gpd
+gdf = gpd.read_file("backup/VerifyBackup_backup_*.gpkg")
+print(f"Rows: {len(gdf)}")
+print(f"Columns: {list(gdf.columns)}")
+print(f"CRS: {gdf.crs}")
+assert "OBJECTID" in gdf.columns
+assert "GlobalID" in gdf.columns
+assert "notes" in gdf.columns
+assert gdf.crs.to_epsg() == 4326
+```
+
+**Expected:**
+- Backup file exists and is readable
+- Feature count matches the authoritative layer
+- All fields preserved (OBJECTID, GlobalID, notes, and any other fields)
+- CRS is EPSG:4326 (WGS 84)
+
+---
+
+### Test 4.4: Backup Directory Auto-Creation
+**Setup:** Valid config, `backup/` directory deleted
+
+**Steps:**
+1. Delete the `backup/` directory: `Remove-Item backup -Recurse -Force`
+2. Run: `python conflate.py --layer "AutoDirTest"` (dry run)
+
+**Expected:**
+- `backup/` directory is automatically recreated
+- Backup file is created inside it
+- No errors related to missing directory
+
+**Verification:**
+```powershell
+Test-Path backup\AutoDirTest_backup_*.gpkg  # should be True
+```
+
+---
+
+### Test 4.5: Checkpoint File Structure
+**Setup:** No checkpoint file exists
+
+**Steps:**
+1. Create a test checkpoint file manually:
+```json
+{
+  "timestamp": "20260714_143022",
+  "layer": "TestLayer",
+  "applied_updates": ["{gid1}", "{gid2}"],
+  "applied_new": ["{gid3}"]
+}
+```
+
+2. Verify with Python:
+```python
+from conflate import load_checkpoint, checkpoint_add_update, checkpoint_add_new
+
+# Load and verify
+data = load_checkpoint("backup/test_checkpoint.json")
+assert data["layer"] == "TestLayer"
+assert len(data["applied_updates"]) == 2
+assert len(data["applied_new"]) == 1
+
+# Test append
+checkpoint_add_update("backup/test_checkpoint.json", "{gid4}")
+data = load_checkpoint("backup/test_checkpoint.json")
+assert data["applied_updates"] == ["{gid1}", "{gid2}", "{gid4}"]
+
+# Test new append
+checkpoint_add_new("backup/test_checkpoint.json", "{gid5}")
+data = load_checkpoint("backup/test_checkpoint.json")
+assert data["applied_new"] == ["{gid3}", "{gid5}"]
+
+# Test nonexistent file
+assert load_checkpoint("backup/nonexistent.json") is None
+```
+
+**Expected:**
+- All checkpoint operations work correctly
+- File structure matches the spec
+- Nonexistent file returns `None`
+
+---
+
+### Test 4.6: Empty Layer Backup
+**Setup:** Valid config, empty authoritative layer (0 features)
+
+**Steps:**
+1. Run: `python conflate.py --layer "EmptyLayer"` (dry run)
+
+**Expected:**
+- Schema validation passes (notes field exists, even with 0 rows)
+- Backup GPKG is created
+- Backup file is valid but contains 0 rows
+
+**Verification:**
+```python
+import geopandas as gpd
+gdf = gpd.read_file("backup/EmptyLayer_backup_*.gpkg")
+assert len(gdf) == 0
+assert "notes" in gdf.columns  # schema preserved even with no rows
+```
+
+---
+
+### Test 4.7: Full Dry Run Flow Through Phase 4
+**Setup:** Valid config, both layers have data with `notes` field
+
+**Steps:**
+1. Run: `python conflate.py --layer "FullFlowTest"` (dry run)
+2. Capture all output
+
+**Expected output sequence:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: FullFlowTest
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/FullFlowTest_backup_<YYYYMMDD_HHMMSS>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+```
+
+**Verification:**
+- All lines present in correct order
+- Feature counts are non-zero and match AGOL
+- `notes_max_length` is a positive integer (or `None` for non-text notes)
+- Backup file created with correct naming pattern
+
+---
+
+### Test 4.8: Multiple Runs — Timestamp Uniqueness (moved from 2.20)
+**Setup:** Valid config, clean `backup/` directory
+
+**Steps:**
+1. Run: `python conflate.py --layer "TimestampTest"` (dry run)
+2. Wait 2 seconds
+3. Run again: `python conflate.py --layer "TimestampTest"` (dry run)
+4. List backup files: `Get-ChildItem backup\TimestampTest_backup_*`
+
+**Expected:**
+- Two backup files with different timestamps
+- Both files are valid GeoPackages with identical data
+- Timestamps differ by at least 1 second
+
+**Verification:**
+```powershell
+$files = Get-ChildItem backup\TimestampTest_backup_*
+$files.Count  # should be 2
+$files[0].Name  # e.g., TimestampTest_backup_20260714_143022.gpkg
+$files[1].Name  # e.g., TimestampTest_backup_20260714_143024.gpkg
+```
+
+---
+
+### Test 4.9: Non-Text Notes Field
+**Setup:** Valid config, authoritative layer where `notes` field is a non-text type (e.g., Integer)
+
+**Steps:**
+1. Run: `python conflate.py --layer "NonTextNotesLayer"` (dry run)
+
+**Expected:**
+- Schema validation passes
+- Output: `"Schema validation passed: notes_max_length=None"`
+- Backup is created successfully
+
+---
+
+### Test 4.10: Restore Mode — Early Exit
+**Setup:** Valid config, accessible layers
+
+**Steps:**
+1. Run: `python conflate.py --layer "RestoreTest" --restore`
+
+**Expected:**
+- Output: `"Mode: RESTORE — Will restore from backup"`
+- Script authenticates to AGOL
+- Script exits after Phase 4 (restore is Phase 10, not yet implemented)
+- No data is loaded or backed up in restore mode
+- Note: This test documents current behavior; restore will be complete in Phase 10
+
+---
+
+### Phase 4 (Schema Validation & Backup)
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 4.2 | Missing notes field (quick fail) | Layer without notes |
+| 2 | 4.6 | Empty layer backup | Empty layer |
+| 3 | 4.1 | **Happy path** (full flow) | Valid layer with notes |
+| 4 | 4.3 | Backup file verification | From Test 4.1 |
+| 5 | 4.4 | Backup dir auto-creation | From Test 4.1 |
+| 6 | 4.5 | Checkpoint file I/O | None |
+| 7 | 4.7 | Full dry run flow | From Test 4.1 |
+| 8 | 4.8 | Timestamp uniqueness | From Test 4.7 |
+| 9 | 4.9 | Non-text notes field | Layer with non-text notes |
+| 10 | 4.10 | Restore mode early exit | Valid config |
+
+---
+
+## Part E: Phase 5 — Spatial Indexing & Matching (`conflate.py`)
+
+### Prerequisites for Phase 5 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds and paths)
+- Layers referenced in config must have features with valid geometries
+- Python environment must have `geopandas`, `pyproj` installed
+- Phase 4 tests must pass (schema validation and backup working)
+
+---
+
+### Test 5.1: Clean Match — d2 Beyond Threshold
+**Setup:** Valid config, both layers with data where some captured points are near one auth point and far from others
+
+**Steps:**
+1. Run: `python conflate.py --layer "CleanMatchTest"` (dry run)
+2. Verify console output shows clean matches with d1 within threshold and d2 beyond threshold
+
+**Expected output:**
+```
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: clean (d1=<x>.<y> ft, d2=<x>.<y> ft)
+Matching complete: <n> clean, 0 ambiguous, 0 new
+```
+
+**Verification:**
+- At least one "clean" match logged
+- d1 value is less than `threshold_ft` (9 ft by default)
+- d2 value is greater than `threshold_ft`
+
+---
+
+### Test 5.2: Clean Match — d2 Significantly Farther
+**Setup:** Valid config, both layers with data where two auth points are close together but captured point is much closer to one
+
+**Steps:**
+1. Run: `python conflate.py --layer "CleanFartherTest"` (dry run)
+2. Verify console output shows clean matches where d2 is within threshold but significantly farther than d1
+
+**Expected output:**
+```
+INFO: Matched OBJECTID <n>: clean (d1=<x>.<y> ft, d2=<x>.<y> ft)
+```
+
+**Verification:**
+- Match type is "clean" (not "ambiguous")
+- d2 > d1 × 1.2 (where 1.2 = 1 + ambiguity_pct/100)
+
+---
+
+### Test 5.3: Ambiguous Match
+**Setup:** Valid config, both layers with data where two auth points are very close together and a captured point is between them
+
+**Steps:**
+1. Run: `python conflate.py --layer "AmbiguousTest"` (dry run)
+2. Verify console output shows ambiguous matches
+
+**Expected output:**
+```
+INFO: Matched OBJECTID <n>: ambiguous (d1=<x>.<y> ft, d2=<x>.<y> ft)
+```
+
+**Verification:**
+- Match type is "ambiguous"
+- d1 and d2 are both within threshold
+- d2 ≤ d1 × 1.2 (ambiguity factor)
+
+---
+
+### Test 5.4: New Match — d1 Beyond Threshold
+**Setup:** Valid config, captured layer has points far from all auth points
+
+**Steps:**
+1. Run: `python conflate.py --layer "NewMatchTest"` (dry run)
+2. Verify console output shows "new" matches
+
+**Expected output:**
+```
+INFO: New OBJECTID <n>: no match within 9 ft (nearest: <x>.<y> ft)
+```
+
+**Verification:**
+- Match type is "new"
+- d1 value is greater than or equal to `threshold_ft` (9 ft)
+
+---
+
+### Test 5.5: Exact Threshold Boundary
+**Setup:** Valid config, captured point positioned exactly at threshold distance from nearest auth point
+
+**Steps:**
+1. Run: `python conflate.py --layer "ThresholdTest"` (dry run)
+2. Verify console output shows "new" match at exact threshold
+
+**Expected output:**
+```
+INFO: New OBJECTID <n>: no match within 9 ft (nearest: 9.0 ft)
+```
+
+**Verification:**
+- Match type is "new" (threshold is exclusive)
+- d1 value equals `threshold_ft`
+
+---
+
+### Test 5.6: Empty Authoritative Layer
+**Setup:** Valid config where authoritative layer is empty (0 features) but captured layer has data
+
+**Steps:**
+1. Run: `python conflate.py --layer "EmptyAuthTest"` (dry run)
+2. Verify all captured points classified as "new"
+
+**Expected output:**
+```
+INFO: New OBJECTID <n>: no match within 9 ft (nearest: N/A)
+```
+
+**Verification:**
+- All match results have `match_type = "new"`
+- `d1` and `d2` are `None` for all results
+
+---
+
+### Test 5.7: Single Authoritative Point
+**Setup:** Valid config, authoritative layer has exactly one feature, captured layer has features near it
+
+**Steps:**
+1. Run: `python conflate.py --layer "SingleAuthTest"` (dry run)
+2. Verify single auth point produces "clean" matches when within threshold
+
+**Expected output:**
+```
+INFO: Matched OBJECTID <n>: clean (d1=<x>.<y> ft, d2=inf ft)
+```
+
+**Verification:**
+- Match type is "clean" when within threshold
+- `d2` is `None` (infinity converted to None)
+
+---
+
+### Test 5.8: Mixed Results
+**Setup:** Valid config, both layers with multiple features at varying distances
+
+**Steps:**
+1. Run: `python conflate.py --layer "MixedTest"` (dry run)
+2. Verify all three match types appear in output
+
+**Expected output:**
+```
+INFO: Matched OBJECTID <n>: clean (d1=<x>.<y> ft, d2=<x>.<y> ft)
+INFO: Matched OBJECTID <m>: ambiguous (d1=<x>.<y> ft, d2=<x>.<y> ft)
+INFO: New OBJECTID <p>: no match within 9 ft (nearest: <x>.<y> ft)
+Matching complete: <c> clean, <a> ambiguous, <n> new
+```
+
+**Verification:**
+- All three match types (clean, ambiguous, new) appear
+- Summary counts match the number of each type logged
+
+---
+
+### Test 5.9: Full Flow Through Phase 5
+**Setup:** Valid config, both layers have data with `notes` field
+
+**Steps:**
+1. Run: `python conflate.py --layer "FullFlowPhase5"` (dry run)
+2. Capture all output from Phase 4 through Phase 5
+
+**Expected output sequence:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: FullFlowPhase5
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/FullFlowPhase5_backup_<YYYYMMDD_HHMMSS>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: <type> (d1=<x>.<y> ft, d2=<x>.<y> ft)
+...
+Matching complete: <c> clean, <a> ambiguous, <n> new
+```
+
+**Verification:**
+- All Phase 4 lines present in correct order
+- Phase 5 header lines present
+- Per-point match logs present
+- Summary line present with correct counts
+
+---
+
+### Test 5.10: Custom threshold_ft
+**Setup:** Modify `config.json` to use a different threshold value
+
+**Steps:**
+1. Modify `config.json`:
+   ```json
+   {
+     "matching": { "threshold_ft": 30, "ambiguity_pct": 20 },
+     "paths": { "backup": "backup/", "reports": "reports/" }
+   }
+   ```
+2. Run: `python conflate.py --layer "CustomThresholdTest"` (dry run)
+3. Run with original config (threshold_ft=9) for comparison
+
+**Expected:**
+- With threshold_ft=30: more "clean" matches, fewer "new" matches
+- With threshold_ft=9: fewer "clean" matches, more "new" matches
+- Summary counts change between the two runs
+
+**Verification:**
+- The `threshold_ft` value from config is used in log messages
+- Classification results change based on threshold value
+
+---
+
+### Test 5.11: Custom ambiguity_pct
+**Setup:** Modify `config.json` to use a different ambiguity percentage
+
+**Steps:**
+1. Modify `config.json`:
+   ```json
+   {
+     "matching": { "threshold_ft": 9, "ambiguity_pct": 50 },
+     "paths": { "backup": "backup/", "reports": "reports/" }
+   }
+   ```
+2. Run: `python conflate.py --layer "CustomAmbiguityTest"` (dry run)
+3. Run with original config (ambiguity_pct=20) for comparison
+
+**Expected:**
+- With ambiguity_pct=50: fewer "ambiguous" matches (wider clean zone)
+- With ambiguity_pct=20: more "ambiguous" matches (narrower clean zone)
+- Summary counts change between the two runs
+
+**Verification:**
+- Classification results change based on ambiguity_pct value
+- The ambiguity factor (1 + ambiguity_pct/100) is correctly applied
+
+---
+
+### Phase 5 (Spatial Indexing & Matching)
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 5.6 | Empty auth layer (quick fail) | Empty auth layer |
+| 2 | 5.4 | New match (d1 beyond threshold) | Layer with distant points |
+| 3 | 5.5 | Exact threshold boundary | Layer with points at 9ft |
+| 4 | 5.1 | **Clean match — d2 beyond** | Two auth points, captured near one |
+| 5 | 5.2 | Clean match — d2 significantly farther | Two close auth points |
+| 6 | 5.3 | **Ambiguous match** | Two very close auth points |
+| 7 | 5.7 | Single auth point | One auth point |
+| 8 | 5.8 | **Mixed results** | Both layers with multiple features |
+| 9 | 5.9 | **Full flow** | Valid config, both layers with data |
+| 10 | 5.10 | Custom threshold_ft | Modify config.json |
+| 11 | 5.11 | Custom ambiguity_pct | Modify config.json |
+
+---
+
 ## Cleanup
 
 After all tests pass:
@@ -720,6 +1258,9 @@ Remove-Item config.local.json -Force
 # Remove test backups and reports
 Remove-Item backup\* -Recurse -Force
 Remove-Item reports\* -Force
+
+# Remove any test checkpoint files
+Remove-Item backup\*checkpoint*.json -Force
 
 # Restore config.json if modified
 # (revert custom paths back to defaults)
@@ -767,3 +1308,18 @@ Remove-Item reports\* -Force
 | 3.7 | Two valid layers | Full pipeline, WGS84 + UTM |
 | 3.8 | Empty auth | Fallback UTM detection |
 | 3.9 | Both empty | Default EPSG:32618 |
+
+### Phase 4
+
+| Test | Layer State | What to Check |
+|------|------------|---------------|
+| 4.1 | Valid data with notes | Full output sequence, backup created |
+| 4.2 | Missing notes field | FATAL error, exit code 1 |
+| 4.3 | Valid data | Backup GPKG readable, all fields present |
+| 4.4 | Valid data, no backup/ dir | Directory auto-created |
+| 4.5 | N/A (manual checkpoint) | JSON I/O works correctly |
+| 4.6 | Empty layer | Backup created, 0 rows |
+| 4.7 | Both layers with data | Complete output sequence |
+| 4.8 | Valid config | Two unique backup timestamps |
+| 4.9 | Non-text notes | notes_max_length=None |
+| 4.10 | Valid config | Restore exits early (Phase 10 pending) |
