@@ -1,8 +1,0 @@
-{
-  "agol": {
-    "username": "Virgintown",
-    "password": "C9zgVj8Tp!!3kBcAX55n"
-  },
-  "captured_layer_url": "https://services5.arcgis.com/ohVzfO1G2OuGbXGd/arcgis/rest/services/Captured_WaterSystem_Testing_Only/FeatureServer/8",
-  "auth_layer_url": "https://services5.arcgis.com/ohVzfO1G2OuGbXGd/arcgis/rest/services/Authoritiatve_Water_System/FeatureServer/8"
-}
