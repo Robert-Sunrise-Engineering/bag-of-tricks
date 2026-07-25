@@ -1584,3 +1584,1100 @@ Remove-Item backup\*checkpoint*.json -Force
 | 4.8 | Valid config | Two unique backup timestamps |
 | 4.9 | Non-text notes | notes_max_length=None |
 | 4.10 | Valid config | Restore exits early (Phase 10 pending) |
+
+---
+
+## Part G: Phase 7 — Dry Run Output (`conflate.py`)
+
+**Status:** COMPLETE ✅
+
+### Prerequisites for Phase 7 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds and paths)
+- Layers referenced in config must have features with valid geometries
+- Python environment must have `geopandas`, `pyproj`, `requests` installed
+- Phase 6 tests must pass (collision resolution working)
+
+---
+
+### Test 7.1: Dry Run — Review GeoPackage Created
+
+**Setup:** Valid config, both layers with data
+
+**Steps:**
+1. Run: `python conflate.py --layer "ReviewTest"` (dry run)
+
+**Expected output:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: ReviewTest
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/ReviewTest_backup_<timestamp>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: <type> (d1=<x>.<y> ft, d2=<x>.<y> ft)
+Matching complete: <c> clean, <a> ambiguous, <n> new
+Detecting collisions...
+No collisions detected. (or: Resolving <n> collision(s)...)
+After collision resolution: <c'> clean, <a'> ambiguous, <n'> new
+Writing review file...
+Review file created: backup/ReviewTest_conflation_review.gpkg
+Writing CSV report...
+Report written: reports/ReviewTest_<timestamp>.csv
+=== Conflation Summary ===
+Matched (clean):     <c'>
+Matched (ambiguous): <a'>
+New:                 <n'>
+Attachments pending: <count>
+Total:               <total>
+```
+
+**Verification:**
+```powershell
+# Check review file exists
+Test-Path "backup\ReviewTest_conflation_review.gpkg"  # should be True
+
+# Check CSV report exists
+Test-Path "reports\ReviewTest_*.csv"  # should be True
+
+# Verify GeoPackage has 4 tables
+sqlite3 "backup\ReviewTest_conflation_review.gpkg" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+# Should output: current_state, proposed_attachments, proposed_new, proposed_updates
+```
+
+---
+
+### Test 7.2: Review GeoPackage — `current_state` Table
+
+**Setup:** Valid config, authoritative layer with known data
+
+**Steps:**
+1. Run dry run with the layer
+2. Read the `current_state` table from the review GeoPackage
+
+**Verification:**
+```python
+import geopandas as gpd
+gdf = gpd.read_file("backup/ReviewTest_conflation_review.gpkg", layer="current_state")
+# Should match the authoritative layer exactly
+assert len(gdf) == <auth_feature_count>
+assert "OBJECTID" in gdf.columns
+assert "GlobalID" in gdf.columns
+assert "COMMENTNOTES" in gdf.columns
+assert gdf.crs.to_epsg() == 4326
+```
+
+---
+
+### Test 7.3: Review GeoPackage — `proposed_updates` Table
+
+**Setup:** Valid config, both layers with data where some captured points match auth points
+
+**Steps:**
+1. Run dry run with the layer
+2. Read the `proposed_updates` table
+
+**Verification:**
+```python
+import geopandas as gpd
+gdf = gpd.read_file("backup/ReviewTest_conflation_review.gpkg", layer="proposed_updates")
+# Should have dual geometry columns
+assert "old_geometry" in gdf.columns
+assert "new_geometry" in gdf.columns
+# Should have metadata columns
+assert "match_type" in gdf.columns
+assert "action" in gdf.columns
+assert "distance_ft" in gdf.columns
+assert "captured_objectid" in gdf.columns
+assert "label" in gdf.columns
+# All rows should have action="updated"
+assert all(gdf["action"] == "updated")
+# All rows should have match_type in (clean, ambiguous)
+assert all(gdf["match_type"].isin(["clean", "ambiguous"]))
+```
+
+---
+
+### Test 7.4: Review GeoPackage — `proposed_new` Table
+
+**Setup:** Valid config, captured layer has points that don't match any auth point
+
+**Steps:**
+1. Run dry run with the layer
+2. Read the `proposed_new` table
+3. Verify notes concatenation
+
+**Verification:**
+```python
+import geopandas as gpd
+gdf = gpd.read_file("backup/ReviewTest_conflation_review.gpkg", layer="proposed_new")
+# Should have metadata columns
+assert "match_type" in gdf.columns
+assert "action" in gdf.columns
+assert "captured_objectid" in gdf.columns
+assert "label" in gdf.columns
+# All rows should have action="appended"
+assert all(gdf["action"] == "appended")
+# All rows should have match_type="new"
+assert all(gdf["match_type"] == "new")
+# Label should contain threshold info
+assert all(gdf["label"].str.contains("no match within"))
+```
+
+---
+
+### Test 7.5: Review GeoPackage — `proposed_attachments` Table
+
+**Setup:** Valid config, captured layer has records with attachments
+
+**Steps:**
+1. Run dry run with the layer
+2. Read the `proposed_attachments` table
+
+**Verification:**
+```python
+import geopandas as gpd
+gdf = gpd.read_file("backup/ReviewTest_conflation_review.gpkg", layer="proposed_attachments")
+# Should have attachment metadata columns
+assert "captured_objectid" in gdf.columns
+assert "auth_globalid" in gdf.columns
+assert "attachment_name" in gdf.columns
+assert "attachment_size_bytes" in gdf.columns
+assert "attachment_type" in gdf.columns
+assert "status" in gdf.columns
+# All rows should have status="pending"
+assert all(gdf["status"] == "pending")
+```
+
+---
+
+### Test 7.6: CSV Report Verification
+
+**Setup:** Valid config, both layers with data
+
+**Steps:**
+1. Run dry run with the layer
+2. Read the CSV report
+
+**Verification:**
+```python
+import pandas as pd
+df = pd.read_csv("reports/ReviewTest_<timestamp>.csv")
+# Should have correct columns
+expected_cols = ["layer", "captured_objectid", "auth_globalid", "distance_ft", "match_type", "action", "attachment_count", "attachment_names"]
+assert list(df.columns) == expected_cols
+# Should have one row per captured record
+assert len(df) == <captured_feature_count>
+# Matched records should have action="updated"
+updated = df[df["action"] == "updated"]
+assert len(updated) == <clean + ambiguous count>
+# New records should have action="appended"
+appended = df[df["action"] == "appended"]
+assert len(appended) == <new count>
+```
+
+---
+
+### Test 7.7: Summary Output Verification
+
+**Setup:** Valid config, both layers with data
+
+**Steps:**
+1. Run dry run with the layer
+2. Capture console output
+
+**Verification:**
+- Output contains `=== Conflation Summary ===`
+- `Matched (clean):` count matches actual clean matches
+- `Matched (ambiguous):` count matches actual ambiguous matches
+- `New:` count matches actual new matches
+- `Attachments pending:` shows attachment count
+- `Total:` equals sum of clean + ambiguous + new
+
+---
+
+### Test 7.8: `--auto-open` Flag
+
+**Setup:** Valid config, both layers with data
+
+**Steps:**
+1. Run: `python conflate.py --layer "AutoOpenTest" --auto-open`
+
+**Expected:**
+- Full dry run flow completes
+- Review GeoPackage is created
+- On Windows: review file opens automatically
+- On Linux: xdg-open is invoked
+
+**Verification:**
+- Review file exists on disk
+- No errors related to auto-open (file may or may not actually open in CI)
+
+---
+
+### Test 7.9: Empty Results — All Tables Created
+
+**Setup:** Valid config, both layers with data but no matches (e.g., very small threshold or far-apart points)
+
+**Steps:**
+1. Run dry run with the layer
+2. Verify all 4 tables exist in the review GeoPackage
+
+**Verification:**
+```powershell
+sqlite3 "backup\EmptyTest_conflation_review.gpkg" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+# Should output: current_state, proposed_attachments, proposed_new, proposed_updates
+# All tables exist even if empty
+```
+
+---
+
+### Test 7.10: Full Flow Through Phase 7
+
+**Setup:** Valid config, both layers with data including clean matches, ambiguous matches, new records, and at least one collision
+
+**Steps:**
+1. Run: `python conflate.py --layer "FullFlowPhase7"` (dry run)
+2. Capture all output
+3. Verify review GeoPackage and CSV report
+
+**Expected output sequence:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: FullFlowPhase7
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/FullFlowPhase7_backup_<timestamp>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: <type> (d1=<x>.<y> ft, d2=<x>.<y> ft)
+...
+Matching complete: <c> clean, <a> ambiguous, <n> new
+Detecting collisions...
+INFO: Collision detected: auth GlobalID <gid> claimed by captured OBJECTID <...> and captured OBJECTID <...>
+  -> OBJECTID <winner> retains match (closest)
+  -> OBJECTID <loser> reclassified as new
+Resolving 1 collision(s)...
+After collision resolution: <c'> clean, <a'> ambiguous, <n'> new
+Writing review file...
+Review file created: backup/FullFlowPhase7_conflation_review.gpkg
+Writing CSV report...
+Report written: reports/FullFlowPhase7_<timestamp>.csv
+=== Conflation Summary ===
+Matched (clean):     <c'>
+Matched (ambiguous): <a'>
+New:                 <n'>
+Attachments pending: <count>
+Total:               <total>
+```
+
+**Verification:**
+- All Phase 4-6 lines present in correct order
+- Phase 7 output lines present
+- Review GeoPackage has 4 tables with correct data
+- CSV report has correct columns and row counts
+- Summary counts match actual data
+
+---
+
+### Phase 7 (Dry Run Output)
+
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 7.9 | Empty results — all tables exist | Data with no matches |
+| 2 | 7.1 | **Happy path** (full dry run) | Valid config, both layers with data |
+| 3 | 7.2 | current_state table verification | From Test 7.1 |
+| 4 | 7.3 | proposed_updates table verification | From Test 7.1 |
+| 5 | 7.4 | proposed_new table with notes | From Test 7.1 |
+| 6 | 7.5 | proposed_attachments table | Captured records with attachments |
+| 7 | 7.6 | CSV report verification | From Test 7.1 |
+| 8 | 7.7 | Summary output verification | From Test 7.1 |
+| 9 | 7.8 | --auto-open flag | From Test 7.1 |
+| 10 | 7.10 | **Full flow** | Valid config, collision scenario |
+
+---
+
+## Part H: Phase 8 — Apply Changes (`conflate.py`)
+
+### Prerequisites for Phase 8 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds, paths, and `apply` section)
+- Layers referenced in config must have features with valid geometries and a `COMMENTNOTES` field
+- Python environment must have `geopandas`, `pyproj` installed
+- Phase 7 tests must pass (dry run output working)
+- **Important:** Phase 8 writes live data to AGOL — use a test layer, not production
+
+---
+
+### Test 8.1: Apply — Happy Path (Full Flow)
+
+**Setup:** Valid config, test layer with known data (use a non-production layer)
+
+**Steps:**
+1. Record the current state of the authoritative layer (feature count, some attribute values)
+2. Run: `python conflate.py --layer "ApplyTest" --apply --no-resume`
+3. Verify the layer in AGOL was updated
+
+**Expected output:**
+```
+Mode: APPLY — Changes will be written to AGOL
+Layer: ApplyTest
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/ApplyTest_backup_<YYYYMMDD_HHMMSS>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: <type> (d1=<x>.<y> ft, d2=<x>.<y> ft)
+...
+Matching complete: <c> clean, <a> ambiguous, <n> new
+Detecting collisions...
+No collisions detected.
+After collision resolution: <c'> clean, <a'> ambiguous, <n'> new
+Writing review file...
+Review file created: backup/ApplyTest_conflation_review.gpkg
+Writing CSV report...
+Report written: reports/ApplyTest_<timestamp>.csv
+=== Conflation Summary ===
+Matched (clean):     <c'>
+Matched (ambiguous): <a'>
+New:                 <n'>
+Attachments pending: <count>
+Total:               <total>
+
+Phase 8: Applying changes to AGOL...
+Previous checkpoint found. Starting fresh. Ignoring previous checkpoint.
+Updating batch 1/1 (N records)...
+  Batch 1: N updated successfully
+Appending batch 1/1 (N records)...
+  Batch 1: N appended successfully
+Checkpoint deleted — all changes applied successfully
+```
+
+**Verification:**
+```python
+# Verify layer was updated in AGOL
+from arcgis.gis import GIS
+gis = GIS("https://www.arcgis.com", username, password)
+layer = gis.content.get(layer_item_id)
+fl = layer.layers[0]
+# Feature count should have increased by number of "new" records
+assert fl.properties.currentVersion == <expected_version>
+```
+
+---
+
+### Test 8.2: Checkpoint — Resume from Previous Run
+
+**Setup:** Valid config, checkpoint file exists from a partial run
+
+**Steps:**
+1. Create a checkpoint file manually (simulating a partial run):
+```json
+{
+  "timestamp": "20260718_120000",
+  "layer": "ResumeTest",
+  "applied_updates": ["{gid1}", "{gid2}"],
+  "applied_new": ["{gid3}"]
+}
+```
+2. Run: `python conflate.py --layer "ResumeTest" --apply`
+3. When prompted, press Enter (default = yes)
+
+**Expected output:**
+```
+Previous checkpoint found. Resume from previous run? [Y/n]:
+Resuming: 2 updates and 1 new records already applied
+Updating batch 1/1 (N records)...  (only unapplied records)
+  Batch 1: N updated successfully
+  Batch 2: M appended successfully
+Checkpoint deleted — all changes applied successfully
+```
+
+**Verification:**
+- Only unapplied records are processed
+- Checkpoint file is deleted after successful completion
+
+---
+
+### Test 8.3: Checkpoint — Ignore Previous Run (`--no-resume`)
+
+**Setup:** Valid config, checkpoint file exists from a previous run
+
+**Steps:**
+1. Create a checkpoint file manually (as in Test 8.2)
+2. Run: `python conflate.py --layer "NoResumeTest" --apply --no-resume`
+
+**Expected output:**
+```
+Previous checkpoint found. Starting fresh. Ignoring previous checkpoint.
+Updating batch 1/1 (N records)...
+  Batch 1: N updated successfully
+  Batch 2: M appended successfully
+Checkpoint deleted — all changes applied successfully
+```
+
+**Verification:**
+- All records are processed (not just unapplied ones)
+- Old checkpoint is deleted
+- New checkpoint is created and then deleted on success
+
+---
+
+### Test 8.4: Checkpoint — Auto-Resume (`--resume`)
+
+**Setup:** Valid config, checkpoint file exists from a previous run
+
+**Steps:**
+1. Create a checkpoint file manually (as in Test 8.2)
+2. Run: `python conflate.py --layer "AutoResumeTest" --apply --resume`
+
+**Expected output:**
+```
+Previous checkpoint found. Resuming from previous run.
+Resuming: 2 updates and 1 new records already applied
+Updating batch 1/1 (N records)...
+  Batch 1: N updated successfully
+  Batch 2: M appended successfully
+Checkpoint deleted — all changes applied successfully
+```
+
+**Verification:**
+- No interactive prompt (auto-resumes)
+- Only unapplied records are processed
+
+---
+
+### Test 8.5: Checkpoint — No Checkpoint with `--resume`
+
+**Setup:** Valid config, no checkpoint file exists
+
+**Steps:**
+1. Ensure no checkpoint files exist in `backup/`
+2. Run: `python conflate.py --layer "NoCheckpointResumeTest" --apply --resume`
+
+**Expected:**
+- Output: `"No checkpoint found at <path>. Cannot resume."`
+- Script exits with code 1
+
+---
+
+### Test 8.6: Apply Updates — Null Preservation
+
+**Setup:** Valid config, captured layer has records with some null attribute values
+
+**Steps:**
+1. Run: `python conflate.py --layer "NullPreserveTest" --apply --no-resume`
+2. After apply, check the authoritative layer in AGOL
+
+**Verification:**
+- Records with null captured values retained their original auth values
+- Non-null captured values were updated
+- `COMMENTNOTES` field has appended notes (not overwritten)
+
+**Verification (via AGOL inspection):**
+```python
+# Check a specific record that had null captured values
+# The original auth value should be preserved
+```
+
+---
+
+### Test 8.7: Apply Updates — Notes Appending
+
+**Setup:** Valid config, authoritative layer records have existing `COMMENTNOTES` values
+
+**Steps:**
+1. Record the existing `COMMENTNOTES` values before apply
+2. Run: `python conflate.py --layer "NotesAppendTest" --apply --no-resume`
+3. Check the `COMMENTNOTES` values after apply
+
+**Verification:**
+- New notes are appended to existing notes (not overwritten)
+- Format: `"Existing notes | FieldName: value | FieldName: value"`
+- Notes are truncated to `notes_max_length` if needed
+
+---
+
+### Test 8.8: Apply Appends — New Records
+
+**Setup:** Valid config, captured layer has records that don't match any auth record
+
+**Steps:**
+1. Run: `python conflate.py --layer "AppendTest" --apply --no-resume`
+2. After apply, check the authoritative layer in AGOL
+
+**Verification:**
+- New records were added to the authoritative layer
+- Feature count increased by the number of "new" records
+- Notes field contains concatenated non-matching attributes
+- `COMMENTNOTES` does NOT contain existing notes (there were none)
+
+---
+
+### Test 8.9: Batch Processing — Large Dataset
+
+**Setup:** Valid config, layer with many records (enough to require multiple batches)
+
+**Steps:**
+1. Modify `config.json` to use a small batch size for testing:
+```json
+{
+  "apply": { "batch_size": 5, "max_retries": 3 }
+}
+```
+2. Run: `python conflate.py --layer "BatchTest" --apply --no-resume`
+
+**Expected output:**
+```
+Phase 8: Applying changes to AGOL...
+Updating batch 1/10 (5 records)...
+  Batch 1: 5 updated successfully
+Updating batch 2/10 (5 records)...
+  Batch 2: 5 updated successfully
+...
+Updating batch 10/10 (5 records)...
+  Batch 10: 5 updated successfully
+Appending batch 1/5 (5 records)...
+  Batch 1: 5 appended successfully
+...
+```
+
+**Verification:**
+- Batch progress messages show correct batch numbers
+- All records processed
+- Config `batch_size` is respected
+
+---
+
+### Test 8.10: Failed Record — Checkpoint Preservation
+
+**Setup:** Valid config, layer where some updates will fail (e.g., invalid field value)
+
+**Steps:**
+1. Run: `python conflate.py --layer "FailTest" --apply --no-resume`
+2. Some records should fail (e.g., due to invalid field values)
+
+**Expected output:**
+```
+Phase 8: Applying changes to AGOL...
+Updating batch 1/1 (N records)...
+  Failed to update OBJECTID <oid> (GlobalID <gid>): <error>
+  Batch 1 failed: <error>. Falling back to one-at-a-time...
+  Failed to update OBJECTID <oid>: <error>
+Checkpoint preserved at backup/FailTest_checkpoint_<timestamp>.json — <n> failures remain. Re-run to resume.
+  Failed update: GlobalID <gid>
+```
+
+**Verification:**
+- Checkpoint file is preserved (not deleted)
+- Failed records are listed in the output
+- Successfully applied records are in the checkpoint's `applied_updates`
+
+---
+
+### Test 8.11: Resume After Partial Failure
+
+**Setup:** Valid config, checkpoint file exists from Test 8.10 (with failures)
+
+**Steps:**
+1. Fix the underlying issue that caused failures (if applicable)
+2. Run: `python conflate.py --layer "FailTest" --apply --resume`
+
+**Expected output:**
+```
+Previous checkpoint found. Resuming from previous run.
+Resuming: <n> updates and <m> new records already applied
+Updating batch 1/1 (N records)...  (only the failed records)
+  Batch 1: N updated successfully
+Checkpoint deleted — all changes applied successfully
+```
+
+**Verification:**
+- Only failed records are retried
+- Checkpoint is deleted after all records succeed
+- No duplicate updates for previously successful records
+
+---
+
+### Test 8.12: Notes Truncation
+
+**Setup:** Valid config, layer with very long notes that exceed `notes_max_length`
+
+**Steps:**
+1. Run: `python conflate.py --layer "TruncationTest" --apply --no-resume`
+
+**Expected output:**
+- Log warning: `"Notes truncated to <max> chars"`
+- Notes field in AGOL is at most `notes_max_length` characters
+
+**Verification:**
+```python
+# Check a record that had truncated notes
+# Length should be <= notes_max_length
+```
+
+---
+
+### Test 8.13: Full Flow Through Phase 8
+
+**Setup:** Valid config, both layers with data including clean matches, ambiguous matches, new records, and at least one collision
+
+**Steps:**
+1. Run: `python conflate.py --layer "FullFlowPhase8" --apply --no-resume`
+2. Capture all output
+3. Verify AGOL layer was updated correctly
+
+**Expected output sequence:**
+```
+Mode: APPLY — Changes will be written to AGOL
+Layer: FullFlowPhase8
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+Loading layers...
+Loaded <n> captured features
+Loaded <n> authoritative features
+Validating schema...
+Schema validation passed: notes_max_length=<value>
+Creating backup...
+Backup created: backup/FullFlowPhase8_backup_<YYYYMMDD_HHMMSS>.gpkg
+Phase 4 complete. Ready for matching (Phase 5).
+Building spatial index...
+Matching captured points to authoritative points...
+INFO: Matched OBJECTID <n>: <type> (d1=<x>.<y> ft, d2=<x>.<y> ft)
+...
+Matching complete: <c> clean, <a> ambiguous, <n> new
+Detecting collisions...
+INFO: Collision detected: auth GlobalID <gid> claimed by captured OBJECTID <...> and captured OBJECTID <...>
+  -> OBJECTID <winner> retains match (closest)
+  -> OBJECTID <loser> reclassified as new
+Resolving 1 collision(s)...
+After collision resolution: <c'> clean, <a'> ambiguous, <n'> new
+Writing review file...
+Review file created: backup/FullFlowPhase8_conflation_review.gpkg
+Writing CSV report...
+Report written: reports/FullFlowPhase8_<timestamp>.csv
+=== Conflation Summary ===
+Matched (clean):     <c'>
+Matched (ambiguous): <a'>
+New:                 <n'>
+Attachments pending: <count>
+Total:               <total>
+
+Phase 8: Applying changes to AGOL...
+Previous checkpoint found. Starting fresh. Ignoring previous checkpoint.
+Updating batch 1/1 (<c'+<a'> records)...
+  Batch 1: <c'+<a'> updated successfully
+Appending batch 1/1 (<n'> records)...
+  Batch 1: <n'> appended successfully
+Checkpoint deleted — all changes applied successfully
+```
+
+**Verification:**
+- All Phase 4-7 lines present in correct order
+- Phase 8 output lines present
+- AGOL layer updated: matched records have new geometry/attributes, new records added
+- Checkpoint deleted (all success)
+
+---
+
+### Test 8.14: Batch Failure — One-at-a-Time Fallback
+
+**Setup:** Valid config, layer where a batch of updates will fail but individual records might succeed
+
+**Steps:**
+1. Run: `python conflate.py --layer "BatchFailTest" --apply --no-resume`
+
+**Expected output:**
+```
+Updating batch 1/1 (N records)...
+  Batch 1 failed: <error>. Falling back to one-at-a-time...
+  Updated OBJECTID <oid> (GlobalID <gid>) — <field_count> fields changed
+  Failed to update OBJECTID <oid> (GlobalID <gid>): <error>
+```
+
+**Verification:**
+- Batch failure triggers one-at-a-time fallback
+- Some records succeed individually while others fail
+- Checkpoint reflects partial success
+
+---
+
+### Phase 8 (Apply Changes)
+
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 8.5 | No checkpoint with --resume (quick fail) | No checkpoint file |
+| 2 | 8.1 | **Happy path** (full apply) | Valid config, test layer |
+| 3 | 8.2 | Checkpoint resume (interactive) | From Test 8.1 |
+| 4 | 8.3 | Checkpoint ignore (--no-resume) | From Test 8.1 |
+| 5 | 8.4 | Checkpoint auto-resume (--resume) | From Test 8.1 |
+| 6 | 8.6 | Null preservation | Captured records with nulls |
+| 7 | 8.7 | Notes appending | Auth records with existing notes |
+| 8 | 8.8 | Batch processing | Many records |
+| 9 | 8.9 | Failed record handling | Records that will fail |
+| 10 | 8.10 | Checkpoint preservation on failure | From Test 8.9 |
+| 11 | 8.11 | Resume after partial failure | From Test 8.10 |
+| 12 | 8.12 | Notes truncation | Long notes |
+| 13 | 8.13 | **Full flow** | Valid config, collision scenario |
+| 14 | 8.14 | Batch failure fallback | Records that batch-fail |
+
+---
+
+### Notes for Phase 8 testing
+
+1. **Use a test layer** — Phase 8 writes live data to AGOL. Never test against production layers without explicit approval.
+
+2. **Verify before and after** — Always record the current state of the authoritative layer before running apply tests.
+
+3. **Restore after testing** — After Phase 8 tests, restore the layer from the backup created during the test:
+   ```
+   python conflate.py --layer "TestLayer" --restore
+   ```
+
+4. **Checkpoint files** — After testing, clean up checkpoint files:
+   ```powershell
+   Remove-Item backup\*checkpoint*.json -Force
+   ```
+
+5. **Config `apply` section** — Ensure `config.json` includes:
+   ```json
+   {
+     "apply": {
+       "batch_size": 50,
+       "max_retries": 3
+     }
+   }
+   ```
+
+---
+
+## Part H: Phase 9 — Attachment Migration (`conflate.py`)
+
+**Status:** COMPLETE ✅
+
+### Prerequisites for Phase 9 tests
+- `config.local.json` must exist with valid credentials and layer URLs
+- `config.json` must exist with valid JSON (matching thresholds and paths)
+- Layers referenced in config must have features with valid geometries
+- **Captured layer must have attachments** on some records (images, PDFs, etc.)
+- **Authoritative layer must have attachments enabled** (`hasAttachments: true`)
+- Python environment must have `geopandas`, `pyproj`, `requests` installed
+- Phase 8 tests must pass (apply changes working)
+
+---
+
+### Test 9.1: Dry Run — Attachment Query (No Upload)
+
+**Setup:** Valid config, captured layer has attachments on matched records
+
+**Steps:**
+1. Run: `python conflate.py --layer "AttachmentDryTest" --migrate-attachments` (dry run, no --apply)
+2. Verify no attachments are downloaded or uploaded
+
+**Expected output:**
+```
+Mode: DRY RUN — No changes will be written
+Layer: AttachmentDryTest
+Captured layer: <captured_name>
+Authoritative layer: <auth_name>
+...
+Matching complete: <c> clean, <a> ambiguous, <n> new
+Writing review file...
+Review file created: backup/AttachmentDryTest_conflation_review.gpkg
+Writing CSV report...
+Report written: reports/AttachmentDryTest_<timestamp>.csv
+=== Conflation Summary ===
+Matched (clean):     <c>
+Matched (ambiguous): <a>
+New:                 <n>
+Attachments pending: <count>
+Total:               <total>
+```
+
+**Verification:**
+```powershell
+# Check review file has proposed_attachments table with "pending" status
+sqlite3 "backup\AttachmentDryTest_conflation_review.gpkg" "SELECT status, COUNT(*) FROM proposed_attachments GROUP BY status"
+# Should show: pending|<count>
+
+# Check CSV report has attachment counts/names
+Get-Content "reports\AttachmentDryTest_*.csv" | Select-String "attachment_count|attachment_names"
+# Should show non-zero attachment_count for matched records
+```
+
+---
+
+### Test 9.2: Apply — Attachment Migration (Happy Path)
+
+**Setup:** Valid config, captured layer has attachments on matched records, auth layer has no existing attachments
+
+**Steps:**
+1. Run: `python conflate.py --layer "AttachmentApplyTest" --apply --migrate-attachments --no-resume`
+2. Verify attachments appear on auth records
+
+**Expected output:**
+```
+...
+Phase 8: Applying changes to AGOL...
+Updating batch 1/1 (N records)...
+  Batch 1: N updated successfully
+Appending batch 1/1 (M records)...
+  Batch 1: M appended successfully
+Checkpoint deleted — all changes applied successfully
+
+Phase 9: Migrating attachments...
+Migrated attachment 'photo1.jpg' (2048 bytes, image/jpeg) from OBJECTID 1 to GlobalID {aaa}
+Migrated attachment 'doc1.pdf' (4096 bytes, application/pdf) from OBJECTID 1 to GlobalID {aaa}
+Attachment migration complete: 2 migrated, 0 skipped, 0 failed
+```
+
+**Verification:**
+```powershell
+# Check attachments exist on auth record via ArcGIS API
+# (requires arcgis API call or ArcGIS Pro)
+# Verify attachment count on auth record matches captured record
+```
+
+---
+
+### Test 9.3: Apply — Skip Existing Attachments
+
+**Setup:** Valid config, captured layer has attachments, auth record already has some of the same attachments
+
+**Steps:**
+1. Run: `python conflate.py --layer "AttachmentSkipTest" --apply --migrate-attachments --no-resume`
+
+**Expected output:**
+```
+Phase 9: Migrating attachments...
+Attachment 'photo1.jpg' already exists on GlobalID {aaa}, skipping
+Migrated attachment 'doc2.pdf' (1024 bytes, application/pdf) from OBJECTID 2 to GlobalID {bbb}
+Attachment migration complete: 1 migrated, 1 skipped, 0 failed
+```
+
+**Verification:**
+- Attachment with same name is skipped (not duplicated)
+- New attachments are migrated
+- Summary counts: migrated + skipped = total attachments on captured records
+
+---
+
+### Test 9.4: Apply — Independent Failure Handling
+
+**Setup:** Valid config, captured layer has multiple attachments on a record, one attachment causes failure (e.g., corrupted or large)
+
+**Steps:**
+1. Run: `python conflate.py --layer "AttachmentFailTest" --apply --migrate-attachments --no-resume`
+
+**Expected output:**
+```
+Phase 9: Migrating attachments...
+Migrated attachment 'photo1.jpg' (2048 bytes, image/jpeg) from OBJECTID 1 to GlobalID {aaa}
+ERROR: Failed to migrate attachment 'corrupt.dat' from OBJECTID 1 to GlobalID {aaa}: <error>
+Migrated attachment 'photo2.jpg' (1024 bytes, image/jpeg) from OBJECTID 1 to GlobalID {aaa}
+Attachment migration complete: 2 migrated, 0 skipped, 1 failed
+```
+
+**Verification:**
+- Failed attachment does NOT abort migration of other attachments
+- Error is logged with attachment name and source OBJECTID
+- Summary counts are accurate: migrated + skipped + failed = total
+
+---
+
+### Test 9.5: Apply — No Attachments on Captured Record
+
+**Setup:** Valid config, captured layer has records with no attachments
+
+**Steps:**
+1. Run: `python conflate.py --layer "NoAttTest" --apply --migrate-attachments --no-resume`
+
+**Expected output:**
+```
+Phase 9: Migrating attachments...
+Attachment migration complete: 0 migrated, 0 skipped, 0 failed
+```
+
+**Verification:**
+- No errors or warnings
+- Summary shows all zeros
+
+---
+
+### Test 9.6: Apply — Captured Record Has No Attachments Enabled
+
+**Setup:** Valid config, captured layer does NOT have attachments enabled
+
+**Steps:**
+1. Run: `python conflate.py --layer "NoAttLayerTest" --apply --migrate-attachments --no-resume`
+
+**Expected output:**
+```
+...
+Phase 9: Migrating attachments...
+Attachment migration complete: 0 migrated, 0 skipped, 0 failed
+```
+
+**Verification:**
+- No errors when querying attachments on a layer without attachments enabled
+- Graceful handling (warning logged, migration continues)
+
+---
+
+### Test 9.7: Apply — Review File Updated with Migration Status
+
+**Setup:** Valid config, captured layer has attachments
+
+**Steps:**
+1. Run: `python conflate.py --layer "ReviewUpdateTest" --apply --migrate-attachments --no-resume`
+2. Check the review GeoPackage after migration
+
+**Verification:**
+```powershell
+# Check proposed_attachments table has updated statuses
+sqlite3 "backup\ReviewUpdateTest_conflation_review.gpkg" "SELECT status, attachment_name FROM proposed_attachments"
+# Should show: migrated|photo1.jpg, migrated|doc1.pdf, etc.
+# NOT: pending|photo1.jpg
+```
+
+**Expected:**
+- `proposed_attachments` table status updated from "pending" to "migrated" (or "skipped"/"failed")
+- All migrated attachments have status = "migrated"
+
+---
+
+### Test 9.8: Apply — Captured Attachments NOT Deleted
+
+**Setup:** Valid config, captured layer has attachments
+
+**Steps:**
+1. Record attachment count on captured record before migration
+2. Run: `python conflate.py --layer "NoDeleteTest" --apply --migrate-attachments --no-resume`
+3. Check attachment count on captured record after migration
+
+**Expected:**
+- Captured record still has all its original attachments
+- Attachments are copied, not moved
+
+**Verification:**
+```powershell
+# Verify captured layer attachments unchanged (via ArcGIS API)
+# attachment_count on captured record should be same before and after
+```
+
+---
+
+### Test 9.9: CSV Report — Attachment Data
+
+**Setup:** Valid config, captured layer has attachments on matched records
+
+**Steps:**
+1. Run: `python conflate.py --layer "CsvReportTest" --migrate-attachments` (dry run)
+2. Check the CSV report
+
+**Verification:**
+```powershell
+# Check CSV has non-zero attachment_count for matched records
+Import-Csv "reports\CsvReportTest_*.csv" | Where-Object { $_.match_type -in @("clean","ambiguous") } | Select-Object captured_objectid, attachment_count, attachment_names
+# Should show: captured_objectid=1, attachment_count=2, attachment_names="photo1.jpg; doc1.pdf"
+```
+
+**Expected:**
+- `attachment_count` column shows actual count (not 0)
+- `attachment_names` column shows semicolon-separated list of attachment names
+
+---
+
+### Test 9.10: Full Flow Through Phase 9
+
+**Setup:** Valid config, both layers with data, captured layer has attachments on some matched records
+
+**Steps:**
+1. Run: `python conflate.py --layer "FullFlowPhase9" --apply --migrate-attachments --no-resume`
+2. Capture all output
+
+**Expected output sequence:**
+```
+Mode: APPLY — Changes will be written to AGOL
+...
+Phase 8: Applying changes to AGOL...
+Updating batch 1/1 (N records)...
+  Batch 1: N updated successfully
+Appending batch 1/1 (M records)...
+  Batch 1: M appended successfully
+Checkpoint deleted — all changes applied successfully
+
+Phase 9: Migrating attachments...
+Migrated attachment 'photo1.jpg' (2048 bytes, image/jpeg) from OBJECTID 1 to GlobalID {aaa}
+Attachment 'doc1.pdf' already exists on GlobalID {bbb}, skipping
+ERROR: Failed to migrate attachment 'bad.dat' from OBJECTID 2 to GlobalID {ccc}: <error>
+Attachment migration complete: 15 migrated, 3 skipped, 1 failed
+```
+
+**Verification:**
+- All Phase 4-8 lines present in correct order
+- Phase 9 output present with migration details
+- Summary counts are accurate
+- Review file updated with migration statuses
+- CSV report has attachment data
+- Captured attachments preserved
+
+---
+
+### Phase 9 (Attachment Migration)
+
+| # | Test | Purpose | Requires |
+|---|------|---------|----------|
+| 1 | 9.5 | No attachments on captured (quick pass) | Layer without attachments |
+| 2 | 9.3 | Skip existing attachments | Auth with existing attachments |
+| 3 | 9.1 | **Dry run — attachment query** | Captured with attachments |
+| 4 | 9.2 | **Happy path — migrate attachments** | Captured with attachments |
+| 5 | 9.4 | Independent failure handling | Multiple attachments, one fails |
+| 6 | 9.6 | Layer without attachments enabled | Captured without attachments |
+| 7 | 9.7 | Review file status update | Captured with attachments |
+| 8 | 9.8 | Captured attachments NOT deleted | Captured with attachments |
+| 9 | 9.9 | CSV report attachment data | Captured with attachments |
+| 10 | 9.10 | **Full flow** | Valid config, collision + attachments |
+
+---
+
+### Notes for Phase 9 testing
+
+1. **Use a test layer with attachments** — Phase 9 writes attachments to AGOL. Test against non-production layers.
+
+2. **Verify attachment sizes** — Large attachments (>100MB) may cause timeouts or failures. Log warnings for very large files.
+
+3. **Check MIME types** — Verify that attachment MIME types are preserved during migration.
+
+4. **Dedup behavior** — If an attachment with the same name already exists on the auth record, it is skipped (not overwritten).
+
+5. **Restore after testing** — After Phase 9 tests, restore the layer from backup and remove migrated attachments:
+   ```
+   python conflate.py --layer "TestLayer" --restore
+   ```
+
+6. **Attachment migration is independent** — Failed attachments do not abort the migration of other attachments or the overall conflation process.
+
+
