@@ -12,7 +12,7 @@
     "hydrants": {
       "authoritative_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/authoritative_water_system/FeatureServer/8",
       "captured_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/collected_water_system/FeatureServer/8",
-      "match_threshold_m": 9.2,
+      "match_threshold_m": 10.67,
       "field_map": {},
       "copy_attachments": true
     }

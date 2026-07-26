@@ -41,6 +41,39 @@ def pick_closest(candidates: list[dict], captured_lon: float, captured_lat: floa
     return (closest_candidate, closest_distance, candidates_with_distances)
 
 
+def pick_closest_unclaimed(
+    candidates: list[dict], captured_lon: float, captured_lat: float, claimed_oids: set
+) -> tuple:
+    """Like pick_closest, but skips candidates whose OBJECTID is already in claimed_oids.
+
+    Used to enforce one-to-one matching within a single run: once an
+    authoritative feature has been claimed by an earlier captured feature, it
+    is no longer eligible to be picked as the closest match for a later one.
+
+    Args:
+        candidates: List of candidate feature dicts, each with "lon", "lat",
+            and "OBJECTID" keys.
+        captured_lon: Longitude of the captured feature.
+        captured_lat: Latitude of the captured feature.
+        claimed_oids: Set of authoritative OBJECTIDs already claimed this run.
+
+    Returns:
+        A 3-tuple: (closest_unclaimed_candidate, closest_unclaimed_distance,
+        all_candidates_with_distances_sorted). The first two elements are the
+        closest candidate/distance NOT in claimed_oids, or (None, None) if
+        every candidate is already claimed. The third element is the full,
+        unfiltered distance-sorted list (same as pick_closest), regardless of
+        claims.
+    """
+    _, _, all_sorted = pick_closest(candidates, captured_lon, captured_lat)
+
+    for candidate, distance in all_sorted:
+        if candidate.get("OBJECTID") not in claimed_oids:
+            return (candidate, distance, all_sorted)
+
+    return (None, None, all_sorted)
+
+
 def find_candidates(
     authoritative_features: list[dict],
     captured_feature: dict,

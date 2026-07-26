@@ -6,7 +6,7 @@ This test suite covers:
 """
 
 import pytest
-from conflate.matching import pick_closest, find_candidates
+from conflate.matching import pick_closest, pick_closest_unclaimed, find_candidates
 from conflate.geometry import geodesic_distance
 
 
@@ -66,6 +66,64 @@ class TestPickClosest:
         assert all_sorted[1][1] == pytest.approx(distance_a)
         # Confirm sorting: first distance < second distance
         assert all_sorted[0][1] < all_sorted[1][1]
+
+
+class TestPickClosestUnclaimed:
+    """Tests for pick_closest_unclaimed, which enforces one-to-one matching by
+    skipping candidates already claimed by an earlier captured feature this run."""
+
+    def test_empty_claimed_matches_pick_closest(self):
+        """With no claims, behaves identically to pick_closest."""
+        candidates = [
+            {"lon": 0.0001, "lat": 0.0, "OBJECTID": 1},
+            {"lon": 0.00001, "lat": 0.0, "OBJECTID": 2},
+        ]
+        closest, distance, all_sorted = pick_closest_unclaimed(candidates, 0.0, 0.0, set())
+        expected_closest, expected_distance, expected_all_sorted = pick_closest(
+            candidates, 0.0, 0.0
+        )
+
+        assert closest == expected_closest
+        assert distance == pytest.approx(expected_distance)
+        assert all_sorted == expected_all_sorted
+
+    def test_closest_already_claimed_falls_through_to_next(self):
+        """If the closest candidate is claimed, the next-closest unclaimed one wins."""
+        candidate_closest = {"lon": 0.00001, "lat": 0.0, "OBJECTID": 1}
+        candidate_next = {"lon": 0.0001, "lat": 0.0, "OBJECTID": 2}
+        candidates = [candidate_next, candidate_closest]
+
+        closest, distance, all_sorted = pick_closest_unclaimed(
+            candidates, 0.0, 0.0, claimed_oids={1}
+        )
+
+        assert closest == candidate_next
+        assert distance == pytest.approx(
+            geodesic_distance(0.0, 0.0, candidate_next["lon"], candidate_next["lat"])
+        )
+        # The full ranked list is unaffected by claims.
+        assert len(all_sorted) == 2
+        assert all_sorted[0][0] == candidate_closest
+
+    def test_all_candidates_claimed_returns_none(self):
+        """If every in-threshold candidate is already claimed, no match is returned."""
+        candidates = [
+            {"lon": 0.00001, "lat": 0.0, "OBJECTID": 1},
+            {"lon": 0.0001, "lat": 0.0, "OBJECTID": 2},
+        ]
+
+        closest, distance, all_sorted = pick_closest_unclaimed(
+            candidates, 0.0, 0.0, claimed_oids={1, 2}
+        )
+
+        assert closest is None
+        assert distance is None
+        assert len(all_sorted) == 2
+
+    def test_empty_candidates_returns_none(self):
+        """Empty candidate list behaves like pick_closest: (None, None, [])."""
+        closest, distance, all_sorted = pick_closest_unclaimed([], 0.0, 0.0, set())
+        assert (closest, distance, all_sorted) == (None, None, [])
 
 
 class TestFindCandidates:

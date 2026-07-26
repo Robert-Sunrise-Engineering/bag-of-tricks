@@ -14,6 +14,7 @@ it only sequences calls into the other ``conflate`` modules.
 """
 
 import argparse
+import json
 import logging
 import os
 from datetime import datetime
@@ -22,12 +23,12 @@ from conflate.config import load_config, load_local_config, validate_layer_confi
 from conflate.gis_client import connect, get_layer, validate_schema, validate_capabilities
 from conflate.paging import fetch_all_features
 from conflate.threshold import format_threshold_both_units
-from conflate.matching import find_candidates, pick_closest
+from conflate.matching import find_candidates, pick_closest_unclaimed
 from conflate.nullfill import build_field_updates
 from conflate.ledger import load_ledger, save_ledger, mark_processed, is_processed
 from conflate.report import write_report
 from conflate.backup import write_backup
-from conflate.attachments import copy_attachments
+from conflate.attachments import copy_attachments, target_attachment_name
 from conflate.apply import apply_updates, apply_appends
 
 logger = logging.getLogger(__name__)
@@ -123,13 +124,15 @@ def _do_rollback(args) -> None:
     gis = connect(local_config)
     authoritative_layer = get_layer(gis, layer_cfg["authoritative_url"])
 
+    ledger_path = os.path.join("state", f"{args.layer}.json")
+
     logger.info(
         "Rolling back layer '%s' using backup=%s report=%s",
         args.layer,
         backup_path,
         report_path,
     )
-    rollback(backup_path, report_path, authoritative_layer)
+    rollback(backup_path, report_path, authoritative_layer, ledger_path)
     logger.info("Rollback complete.")
 
 
@@ -206,6 +209,13 @@ def main() -> None:
     planned_appends = []  # each: {"attributes":..., "geometry":..., "_captured_global_id":..., "_captured_oid":...}
     planned_rows = []  # for the report
 
+    # Authoritative OIDs already matched by an earlier captured feature this
+    # run. Enforces one-to-one matching: once claimed, a candidate is no
+    # longer eligible to be picked as the closest match for a later captured
+    # feature (prevents two captured features from both updating the same
+    # authoritative record).
+    claimed_authoritative_oids = set()
+
     for raw_captured in captured_features_raw:
         captured_attrs = raw_captured.get("attributes", {})
         captured_geometry = raw_captured.get("geometry") or {}
@@ -229,12 +239,16 @@ def main() -> None:
             threshold_m,
         )
 
-        # 7c: pick closest
-        closest, distance, _all_sorted = pick_closest(candidates, captured_lon, captured_lat)
+        # 7c: pick closest candidate not already claimed by an earlier captured
+        # feature this run (enforces one-to-one matching).
+        closest, distance, _all_sorted = pick_closest_unclaimed(
+            candidates, captured_lon, captured_lat, claimed_authoritative_oids
+        )
 
         if closest is not None:
             # 7d: build an update action
             authoritative_oid = closest.get("OBJECTID")
+            claimed_authoritative_oids.add(authoritative_oid)
             authoritative_global_id = closest.get("GlobalID")
             authoritative_raw_attrs = authoritative_by_oid.get(authoritative_oid, {}).get(
                 "attributes", {}
@@ -369,19 +383,22 @@ def main() -> None:
         success = result["success"]
         target_oid = planned["_authoritative_oid"]
         attachments_status = None
+        added_attachment_ids = []
 
         if success and copy_attachments_enabled:
-            attachments_status, _already_copied = copy_attachments(
+            attachments_status, already_copied_names, added_attachment_ids = copy_attachments(
                 captured_layer,
                 captured_oid,
                 authoritative_layer,
                 target_oid,
+                captured_global_id,
                 already_copied=_existing_attachment_names(
-                    captured_layer, captured_oid, authoritative_layer, target_oid
+                    captured_layer, captured_oid, authoritative_layer, target_oid, captured_global_id
                 ),
             )
         elif success:
             attachments_status = "0/0"
+            added_attachment_ids = []
 
         ledgered = False
         if success and _attachments_fully_succeeded(attachments_status):
@@ -408,6 +425,7 @@ def main() -> None:
                 "success": success,
                 "error": result["error"],
                 "attachments_status": attachments_status,
+                "attachments_added": json.dumps(added_attachment_ids),
                 "ledgered": ledgered,
             }
         )
@@ -419,19 +437,22 @@ def main() -> None:
         success = result["success"]
         target_oid = result["result_oid"]
         attachments_status = None
+        added_attachment_ids = []
 
         if success and copy_attachments_enabled:
-            attachments_status, _already_copied = copy_attachments(
+            attachments_status, already_copied_names, added_attachment_ids = copy_attachments(
                 captured_layer,
                 captured_oid,
                 authoritative_layer,
                 target_oid,
+                captured_global_id,
                 already_copied=_existing_attachment_names(
-                    captured_layer, captured_oid, authoritative_layer, target_oid
+                    captured_layer, captured_oid, authoritative_layer, target_oid, captured_global_id
                 ),
             )
         elif success:
             attachments_status = "0/0"
+            added_attachment_ids = []
 
         ledgered = False
         if success and _attachments_fully_succeeded(attachments_status):
@@ -454,6 +475,7 @@ def main() -> None:
                 "threshold_m": threshold_m,
                 "success": success,
                 "error": result["error"],
+                "attachments_added": json.dumps(added_attachment_ids),
                 "attachments_status": attachments_status,
                 "ledgered": ledgered,
             }
@@ -479,32 +501,41 @@ def main() -> None:
     )
 
 
-def _existing_attachment_names(source_layer, source_oid, target_layer, target_oid) -> set:
-    """Return the set of attachment names from the source that already exist on
-    the target, i.e. the ones a prior (partially-failed) copy attempt already
+def _existing_attachment_names(
+    source_layer, source_oid, target_layer, target_oid, captured_global_id
+) -> set:
+    """Return the set of expected target-side attachment names (per
+    target_attachment_name) for source attachments that already exist on the
+    target, i.e. the ones a prior (partially-failed) copy attempt already
     succeeded on.
 
     Used to seed copy_attachments' already_copied set on retries, so those
-    attachments aren't re-uploaded. Intersected with the source's own
-    attachment names (rather than returning all target names) because the
-    authoritative/target feature may have pre-existing attachments of its
-    own that were never part of this copy — including those in the seed
-    would inflate copy_attachments' "n/n" success count past the source's
-    total and make the "n/n" ledger check permanently fail.
+    attachments aren't re-uploaded. Computed as each source attachment's
+    collision-proof expected target name intersected with the target's actual
+    attachment names — never just the target's own names — because the
+    authoritative/target feature may have pre-existing attachments of its own
+    that were never part of this copy (a generically-named leftover attachment,
+    for instance) and including those in the seed would both inflate
+    copy_attachments' "n/n" success count and, more importantly, cause it to
+    skip a genuinely new upload it mistakes for one already done.
 
     If listing fails for any reason, falls back to an empty set (worst case:
     a harmless re-upload attempt).
     """
     try:
-        source_names = {
-            a.get("name") for a in source_layer.attachments.get_list(source_oid) if a.get("name")
-        }
+        source_attachments = source_layer.attachments.get_list(source_oid)
         target_names = {
             a.get("name") for a in target_layer.attachments.get_list(target_oid) if a.get("name")
         }
     except Exception:
         return set()
-    return source_names & target_names
+
+    expected_target_names = {
+        target_attachment_name(captured_global_id, a.get("id"), a.get("name"))
+        for a in source_attachments
+        if a.get("name") and a.get("id")
+    }
+    return expected_target_names & target_names
 
 
 def _attachments_fully_succeeded(status: str) -> bool:
