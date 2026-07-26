@@ -1,0 +1,6 @@
+{
+  "portal_url": "https://your-org.maps.arcgis.com/",
+  "auth_type": "oauth",
+  "client_id": "your_registered_app_client_id",
+  "profile": "your_profile_name"
+}

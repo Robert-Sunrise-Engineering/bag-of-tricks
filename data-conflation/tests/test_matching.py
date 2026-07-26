@@ -1,0 +1,372 @@
+"""Tests for the matching module.
+
+This test suite covers:
+- pick_closest: finding and ranking candidates by distance
+- find_candidates: filtering by type and spatial proximity
+"""
+
+import pytest
+from conflate.matching import pick_closest, find_candidates
+from conflate.geometry import geodesic_distance
+
+
+class TestPickClosest:
+    """Tests for the pick_closest function."""
+
+    def test_pick_closest_empty_list(self):
+        """Test pick_closest with an empty candidate list."""
+        result = pick_closest([], 0.0, 0.0)
+        assert result == (None, None, [])
+
+    def test_pick_closest_single_candidate(self):
+        """Test pick_closest with a single candidate."""
+        candidates = [{"lon": 0.00001, "lat": 0.0, "name": "candidate1"}]
+        closest, distance, all_sorted = pick_closest(candidates, 0.0, 0.0)
+
+        assert closest == candidates[0]
+        assert distance == pytest.approx(geodesic_distance(0.0, 0.0, 0.00001, 0.0))
+        assert len(all_sorted) == 1
+        assert all_sorted[0][0] == candidates[0]
+
+    def test_pick_closest_multiple_candidates_sorted(self):
+        """Test that pick_closest returns all candidates sorted by distance (Fixture C).
+
+        Two same-type in-threshold candidates at different known distances.
+        Confirm pick_closest picks the genuinely closer one and returns sorted list.
+        """
+        # Create a captured point at origin
+        captured_lon, captured_lat = 0.0, 0.0
+
+        # Create two candidates at different distances from captured point
+        # Candidate A: further away but still close (shifted by 0.0001 degrees lon)
+        candidate_a = {"lon": 0.0001, "lat": 0.0, "type": "point", "id": "A"}
+        distance_a = geodesic_distance(captured_lon, captured_lat,
+                                       candidate_a["lon"], candidate_a["lat"])
+
+        # Candidate B: much closer (shifted by 0.00001 degrees lon)
+        candidate_b = {"lon": 0.00001, "lat": 0.0, "type": "point", "id": "B"}
+        distance_b = geodesic_distance(captured_lon, captured_lat,
+                                       candidate_b["lon"], candidate_b["lat"])
+
+        # Sanity check: B should be closer than A
+        assert distance_b < distance_a
+
+        candidates = [candidate_a, candidate_b]
+        closest, closest_distance, all_sorted = pick_closest(candidates, captured_lon, captured_lat)
+
+        # Should pick the closer one (B)
+        assert closest == candidate_b
+        assert closest_distance == pytest.approx(distance_b)
+
+        # all_sorted should have 2 entries, sorted by distance
+        assert len(all_sorted) == 2
+        assert all_sorted[0][0] == candidate_b
+        assert all_sorted[0][1] == pytest.approx(distance_b)
+        assert all_sorted[1][0] == candidate_a
+        assert all_sorted[1][1] == pytest.approx(distance_a)
+        # Confirm sorting: first distance < second distance
+        assert all_sorted[0][1] < all_sorted[1][1]
+
+
+class TestFindCandidates:
+    """Tests for the find_candidates function."""
+
+    def test_find_candidates_same_type_within_threshold(self):
+        """Test find_candidates with 2+ same-type candidates, one within threshold (Fixture A).
+
+        A captured point with 2+ same-type authoritative candidates, where exactly
+        one is within threshold_m. Call find_candidates FIRST, then pick_closest
+        on the result.
+        """
+        # Captured point at origin
+        captured_feature = {
+            "lon": 0.0,
+            "lat": 0.0,
+            "type": "park",
+            "name": "captured"
+        }
+
+        # Authoritative features: 2 of same type, one within threshold, one outside
+        # Candidate 1: ~11 meters away (0.0001 degrees)
+        candidate_1 = {
+            "lon": 0.0001,
+            "lat": 0.0,
+            "type": "park",
+            "id": "auth_1"
+        }
+
+        # Candidate 2: very far away (0.01 degrees ≈ 1111 meters)
+        candidate_2 = {
+            "lon": 0.01,
+            "lat": 0.0,
+            "type": "park",
+            "id": "auth_2"
+        }
+
+        authoritative_features = [candidate_1, candidate_2]
+        threshold_m = 50.0  # Only candidate_1 should be within this
+
+        # Call find_candidates with the full list
+        result = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=threshold_m
+        )
+
+        # Should return only candidate_1
+        assert len(result) == 1
+        assert result[0] == candidate_1
+
+        # Now call pick_closest on the filtered result
+        closest, distance, all_sorted = pick_closest(result,
+                                                      captured_feature["lon"],
+                                                      captured_feature["lat"])
+        assert closest == candidate_1
+        assert distance == pytest.approx(
+            geodesic_distance(captured_feature["lon"], captured_feature["lat"],
+                            candidate_1["lon"], candidate_1["lat"])
+        )
+
+    def test_find_candidates_only_type_outside_threshold(self):
+        """Test find_candidates where only same-type candidate is outside threshold (Fixture B).
+
+        A captured point where the only candidate of the same type is OUTSIDE
+        threshold_m. Confirm find_candidates returns an empty list.
+        """
+        captured_feature = {
+            "lon": 0.0,
+            "lat": 0.0,
+            "type": "hospital",
+            "name": "captured"
+        }
+
+        # Only one hospital candidate, far away (0.01 degrees ≈ 1111 meters)
+        candidate_hospital = {
+            "lon": 0.01,
+            "lat": 0.0,
+            "type": "hospital",
+            "id": "hospital_1"
+        }
+
+        authoritative_features = [candidate_hospital]
+        threshold_m = 50.0  # Candidate is much further than this
+
+        result = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=threshold_m
+        )
+
+        # Should return empty list
+        assert result == []
+
+    def test_find_candidates_type_exclusion_with_mixed_types(self):
+        """Test that type matching is enforced with mixed-type list (Fixture D).
+
+        THE IMPORTANT ONE: A captured point where a DIFFERENT-type candidate is
+        spatially CLOSER to the captured point than any same-type candidate.
+        Build a mixed-type authoritative_features list (same-type candidate further
+        away but within threshold, different-type candidate very close but wrong type)
+        and call find_candidates on this MIXED list (NOT a pre-filtered list).
+        Confirm the returned list does NOT include the closer wrong-type candidate,
+        i.e., the type exclusion is actually happening inside find_candidates itself.
+        """
+        # Captured point at origin
+        captured_feature = {
+            "lon": 0.0,
+            "lat": 0.0,
+            "type": "restaurant",
+            "name": "captured"
+        }
+
+        # Different-type candidate: VERY CLOSE (0.00001 degrees ≈ 1.1 meters) but wrong type
+        wrong_type_close = {
+            "lon": 0.00001,
+            "lat": 0.0,
+            "type": "cafe",  # Different type!
+            "id": "cafe_1"
+        }
+        distance_wrong_type = geodesic_distance(
+            captured_feature["lon"], captured_feature["lat"],
+            wrong_type_close["lon"], wrong_type_close["lat"]
+        )
+
+        # Same-type candidate: FURTHER AWAY (0.0001 degrees ≈ 11 meters) but correct type
+        same_type_far = {
+            "lon": 0.0001,
+            "lat": 0.0,
+            "type": "restaurant",  # Same type as captured
+            "id": "restaurant_1"
+        }
+        distance_same_type = geodesic_distance(
+            captured_feature["lon"], captured_feature["lat"],
+            same_type_far["lon"], same_type_far["lat"]
+        )
+
+        # Verify that wrong-type is actually closer
+        assert distance_wrong_type < distance_same_type
+
+        # Create a genuinely MIXED authoritative list (not pre-filtered)
+        authoritative_features = [wrong_type_close, same_type_far]
+        threshold_m = 50.0  # Both are within threshold, but only same-type should pass
+
+        # Call find_candidates on the MIXED list
+        result = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=threshold_m
+        )
+
+        # Should return only the same-type candidate, NOT the closer wrong-type one
+        assert len(result) == 1
+        assert result[0] == same_type_far
+        assert result[0]["type"] == "restaurant"
+
+        # Verify the wrong-type is not in the result
+        assert wrong_type_close not in result
+
+    def test_find_candidates_no_type_fields_matches_on_distance_only(self):
+        """Test find_candidates with type_field_authoritative/type_field_captured
+        omitted (None): the closer wrong-type candidate from Fixture D should now
+        be included, since there's no type filter to exclude it.
+        """
+        captured_feature = {
+            "lon": 0.0,
+            "lat": 0.0,
+            "type": "restaurant",
+            "name": "captured"
+        }
+
+        wrong_type_close = {
+            "lon": 0.00001,
+            "lat": 0.0,
+            "type": "cafe",
+            "id": "cafe_1"
+        }
+
+        same_type_far = {
+            "lon": 0.0001,
+            "lat": 0.0,
+            "type": "restaurant",
+            "id": "restaurant_1"
+        }
+
+        authoritative_features = [wrong_type_close, same_type_far]
+        threshold_m = 50.0
+
+        result = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative=None,
+            type_field_captured=None,
+            threshold_m=threshold_m
+        )
+
+        # Both are within threshold; with no type filter, both should be returned.
+        assert len(result) == 2
+        ids = {f["id"] for f in result}
+        assert ids == {"cafe_1", "restaurant_1"}
+
+    def test_find_candidates_multiple_threshold(self):
+        """Test find_candidates respects the distance threshold correctly."""
+        captured_feature = {
+            "lon": 0.0,
+            "lat": 0.0,
+            "type": "school",
+            "name": "captured"
+        }
+
+        # Create candidates at increasing distances
+        candidates_data = [
+            {"lon": 0.00001, "lat": 0.0, "type": "school", "id": "school_1"},  # ~1.1m
+            {"lon": 0.0001, "lat": 0.0, "type": "school", "id": "school_2"},   # ~11m
+            {"lon": 0.001, "lat": 0.0, "type": "school", "id": "school_3"},    # ~111m
+        ]
+
+        authoritative_features = candidates_data
+
+        # With tight threshold: only school_1
+        result_10m = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=10.0
+        )
+        assert len(result_10m) == 1
+        assert result_10m[0]["id"] == "school_1"
+
+        # With medium threshold: school_1 and school_2
+        result_50m = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=50.0
+        )
+        assert len(result_50m) == 2
+        ids_50m = {f["id"] for f in result_50m}
+        assert ids_50m == {"school_1", "school_2"}
+
+        # With large threshold: all candidates
+        result_200m = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=200.0
+        )
+        assert len(result_200m) == 3
+
+
+class TestIntegration:
+    """Integration tests combining find_candidates and pick_closest."""
+
+    def test_find_and_pick_workflow(self):
+        """Test the typical workflow: find_candidates then pick_closest."""
+        captured_feature = {
+            "lon": 0.0,
+            "lat": 0.0,
+            "type": "bridge",
+            "name": "captured"
+        }
+
+        authoritative_features = [
+            {"lon": 0.00001, "lat": 0.0, "type": "bridge", "id": "bridge_1"},
+            {"lon": 0.0001, "lat": 0.0, "type": "bridge", "id": "bridge_2"},
+            {"lon": 0.01, "lat": 0.0, "type": "bridge", "id": "bridge_3"},  # Far
+            {"lon": 0.00005, "lat": 0.0, "type": "road", "id": "road_1"},   # Different type
+        ]
+
+        # Find candidates within 100m with matching type
+        candidates = find_candidates(
+            authoritative_features,
+            captured_feature,
+            type_field_authoritative="type",
+            type_field_captured="type",
+            threshold_m=100.0
+        )
+
+        # Should have bridge_1 and bridge_2, but not bridge_3 (too far) or road_1 (wrong type)
+        assert len(candidates) == 2
+        ids = {f["id"] for f in candidates}
+        assert ids == {"bridge_1", "bridge_2"}
+
+        # Pick the closest one
+        closest, distance, all_sorted = pick_closest(
+            candidates,
+            captured_feature["lon"],
+            captured_feature["lat"]
+        )
+
+        # bridge_1 should be closest
+        assert closest["id"] == "bridge_1"
+        assert len(all_sorted) == 2
+        assert all_sorted[0][0]["id"] == "bridge_1"
+        assert all_sorted[1][0]["id"] == "bridge_2"

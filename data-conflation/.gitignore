@@ -1,0 +1,11 @@
+config.local.json
+state/*
+!state/.gitkeep
+backups/*
+!backups/.gitkeep
+reports/*
+!reports/.gitkeep
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
