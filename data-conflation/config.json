@@ -15,6 +15,36 @@
       "match_threshold_m": 10.67,
       "field_map": {},
       "copy_attachments": true
+    },
+    "hydrant_valves": {
+      "authoritative_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/authoritative_water_system/FeatureServer/9",
+      "captured_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/collected_water_system/FeatureServer/9",
+      "match_threshold_m": 10.67,
+      "field_map": {},
+      "copy_attachments": true
+    },
+    "water_network_structures": {
+      "authoritative_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/authoritative_water_system/FeatureServer/10",
+      "captured_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/collected_water_system/FeatureServer/10",
+      "match_threshold_m": 10.67,
+      "type_field_authoritative": "STRUCTTYPE",
+      "type_field_captured": "STRUCTTYPE",
+      "field_map": {},
+      "copy_attachments": true
+    },
+    "water_service_connections": {
+      "authoritative_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/authoritative_water_system/FeatureServer/12",
+      "captured_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/collected_water_system/FeatureServer/12",
+      "match_threshold_m": 10.67,
+      "field_map": {},
+      "copy_attachments": true
+    },
+    "water_system_valves": {
+      "authoritative_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/authoritative_water_system/FeatureServer/13",
+      "captured_url": "https://services.arcgis.com/0eQ6yjEtstKi5cDb/arcgis/rest/services/collected_water_system/FeatureServer/13",
+      "match_threshold_m": 10.67,
+      "field_map": {},
+      "copy_attachments": true
     }
   }
 }

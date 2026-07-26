@@ -1,7 +1,9 @@
 """Tests for conflate.backup module."""
 
+import json
+
 import pytest
-from conflate.backup import write_backup, load_backup
+from conflate.backup import write_backup, load_backup, load_backup_meta
 
 
 def test_round_trip_preserves_features_and_types(tmp_path):
@@ -45,7 +47,7 @@ def test_round_trip_preserves_features_and_types(tmp_path):
 
     # Write to backup file
     backup_path = tmp_path / "test_backup.json"
-    write_backup(original_features, backup_path)
+    write_backup(original_features, backup_path, "hydrants", "https://example.com/FeatureServer/0")
 
     # Load from backup file
     loaded_features = load_backup(backup_path)
@@ -88,3 +90,31 @@ def test_load_backup_nonexistent_file_raises_filenotfounderror(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         load_backup(nonexistent_path)
+
+
+def test_write_backup_records_layer_identity(tmp_path):
+    """write_backup stores layer/authoritative_url; load_backup_meta returns them."""
+    backup_path = tmp_path / "test_backup.json"
+    write_backup([], backup_path, "hydrant_valves", "https://example.com/FeatureServer/9")
+
+    meta = load_backup_meta(backup_path)
+    assert meta["layer"] == "hydrant_valves"
+    assert meta["authoritative_url"] == "https://example.com/FeatureServer/9"
+    assert meta["entries"] == []
+
+
+def test_load_backup_meta_accepts_legacy_bare_list_format(tmp_path):
+    """Backups written before layer identity was tracked are a bare JSON list;
+    load_backup_meta should still load them, with layer/authoritative_url as None."""
+    legacy_path = tmp_path / "legacy_backup.json"
+    legacy_entries = [{"oid": 1, "attributes": {"a": 1}, "geometry": {"x": 0, "y": 0}}]
+    with open(legacy_path, "w", encoding="utf-8") as f:
+        json.dump(legacy_entries, f)
+
+    meta = load_backup_meta(legacy_path)
+    assert meta["layer"] is None
+    assert meta["authoritative_url"] is None
+    assert meta["entries"] == legacy_entries
+
+    # load_backup (used by rollback.py) still works against legacy files too
+    assert load_backup(legacy_path) == legacy_entries

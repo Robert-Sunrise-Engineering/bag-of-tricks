@@ -86,6 +86,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "rolls back that run instead of doing a normal conflation run.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="With --rollback: proceed even if the backup/report file has no "
+        "recorded layer identity (predates the layer-mismatch safety check) "
+        "and so can't be verified against --layer. Only use this after "
+        "manually confirming the backup/report really were produced for "
+        "--layer's value. Has no effect otherwise.",
+    )
+    parser.add_argument(
         "--backup-dir",
         default="backups",
         help="Directory to write/read backup files (default: backups).",
@@ -132,7 +142,14 @@ def _do_rollback(args) -> None:
         backup_path,
         report_path,
     )
-    rollback(backup_path, report_path, authoritative_layer, ledger_path)
+    rollback(
+        backup_path,
+        report_path,
+        authoritative_layer,
+        ledger_path,
+        expected_layer_name=args.layer,
+        force=args.force,
+    )
     logger.info("Rollback complete.")
 
 
@@ -286,6 +303,7 @@ def main() -> None:
                     "matched_authoritative_oid": authoritative_oid,
                     "distance_m": distance,
                     "threshold_m": threshold_m,
+                    "layer": layer_name,
                 }
             )
         else:
@@ -324,6 +342,7 @@ def main() -> None:
                     "matched_authoritative_oid": None,
                     "distance_m": None,
                     "threshold_m": threshold_m,
+                    "layer": layer_name,
                 }
             )
 
@@ -359,7 +378,7 @@ def main() -> None:
             )
 
     backup_path = os.path.join(args.backup_dir, f"{layer_name}_{run_timestamp}.json")
-    write_backup(backup_entries, backup_path)
+    write_backup(backup_entries, backup_path, layer_name, layer_cfg["authoritative_url"])
     logger.info("Backed up %d pre-edit authoritative features to %s", len(backup_entries), backup_path)
 
     # 9b: apply updates and appends (batched, one call each)
@@ -427,6 +446,7 @@ def main() -> None:
                 "attachments_status": attachments_status,
                 "attachments_added": json.dumps(added_attachment_ids),
                 "ledgered": ledgered,
+                "layer": layer_name,
             }
         )
 
@@ -478,6 +498,7 @@ def main() -> None:
                 "attachments_added": json.dumps(added_attachment_ids),
                 "attachments_status": attachments_status,
                 "ledgered": ledgered,
+                "layer": layer_name,
             }
         )
 

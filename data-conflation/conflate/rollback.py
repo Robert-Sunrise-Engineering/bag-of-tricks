@@ -11,14 +11,74 @@ import json
 import logging
 
 from conflate.apply import apply_updates
-from conflate.backup import load_backup
+from conflate.backup import load_backup_meta
 from conflate.ledger import load_ledger, save_ledger
 from conflate.attachments import delete_attachments_batch
 
 logger = logging.getLogger(__name__)
 
 
-def rollback(backup_path, report_path, layer, ledger_path) -> None:
+class LayerMismatchError(Exception):
+    """Raised when --layer doesn't match the layer a backup/report was generated for."""
+
+
+def _check_layer_match(
+    backup_meta: dict, report_rows: list[dict], expected_layer_name: str, force: bool = False
+) -> None:
+    """Raise LayerMismatchError if the backup or report were recorded for a
+    different layer than ``expected_layer_name`` (the CLI's --layer value).
+
+    Legacy backups/reports with no recorded layer name (written before this
+    guard existed) can't be checked at all — that is exactly the situation
+    that let a --layer typo silently delete the wrong live layer in the
+    first place, so this fails closed by default and requires ``force=True``
+    (an explicit, deliberate opt-in) to proceed anyway.
+    """
+    backup_layer = backup_meta.get("layer")
+    if backup_layer is not None and backup_layer != expected_layer_name:
+        raise LayerMismatchError(
+            f"Refusing to roll back: --layer was {expected_layer_name!r}, but the "
+            f"backup file was recorded for layer {backup_layer!r}. Pass "
+            f"--layer {backup_layer!r} instead, or double-check you have the "
+            f"right backup file."
+        )
+
+    report_layers = {row.get("layer") for row in report_rows if row.get("layer")}
+    if report_layers and report_layers != {expected_layer_name}:
+        raise LayerMismatchError(
+            f"Refusing to roll back: --layer was {expected_layer_name!r}, but the "
+            f"report file was recorded for layer(s) {sorted(report_layers)!r}. Pass "
+            f"the matching --layer instead, or double-check you have the right "
+            f"report file."
+        )
+
+    if backup_layer is None and not report_layers:
+        if not force:
+            raise LayerMismatchError(
+                f"Refusing to roll back: neither the backup nor the report file has "
+                f"a recorded layer identity (they predate this safety check), so "
+                f"--layer {expected_layer_name!r} cannot be verified against them. "
+                f"Manually confirm these files were actually produced for layer "
+                f"{expected_layer_name!r}, then pass force=True (CLI: --force) to "
+                f"proceed anyway."
+            )
+        logger.warning(
+            "Backup and report have no recorded layer identity (written before "
+            "this check existed); proceeding without verifying --layer %r is "
+            "correct for these files, because force=True was passed.",
+            expected_layer_name,
+        )
+
+
+def rollback(
+    backup_path,
+    report_path,
+    layer,
+    ledger_path,
+    *,
+    expected_layer_name=None,
+    force=False,
+) -> None:
     """
     Undo a prior run's writes to ``layer`` using its backup and report.
 
@@ -35,6 +95,22 @@ def rollback(backup_path, report_path, layer, ledger_path) -> None:
                      back (see ``ledger.load_ledger``/``save_ledger``). Entries
                      for captured features processed by this run are cleared
                      so a subsequent run will reconsider them.
+        expected_layer_name: The config.json layer key the caller resolved
+                     ``layer`` from (i.e. the CLI's ``--layer`` value). If
+                     given, and the backup and/or report recorded a
+                     different layer name, this raises ``LayerMismatchError``
+                     *before* touching ``layer`` at all. Backups/reports
+                     written before layer identity was tracked have no
+                     recorded name at all and can't be checked either way;
+                     that ambiguity is exactly what caused a --layer typo to
+                     silently delete the wrong live layer previously, so
+                     those also raise LayerMismatchError unless ``force``
+                     is set.
+        force: When True, allows the rollback to proceed against a
+                     backup/report with no recorded layer identity (see
+                     ``expected_layer_name`` above). Has no effect on an
+                     actual recorded mismatch — that always raises. Ignored
+                     if ``expected_layer_name`` is None.
 
     Behavior:
         - Rows with action == "updated" are restored to their pre-edit
@@ -45,14 +121,20 @@ def rollback(backup_path, report_path, layer, ledger_path) -> None:
 
     Returns:
         None. Propagates FileNotFoundError if backup_path or report_path
-        don't exist.
+        don't exist. Raises LayerMismatchError if expected_layer_name is
+        given and doesn't match what the backup/report recorded (or can't
+        be verified and force wasn't set).
     """
     with open(report_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         report_rows = list(reader)
 
-    backup_entries = load_backup(backup_path)
+    backup_meta = load_backup_meta(backup_path)
+    backup_entries = backup_meta["entries"]
     backup_lookup = {entry["oid"]: entry for entry in backup_entries}
+
+    if expected_layer_name is not None:
+        _check_layer_match(backup_meta, report_rows, expected_layer_name, force=force)
 
     # --- Step 1: build restores for updated rows ---
     restores = []
