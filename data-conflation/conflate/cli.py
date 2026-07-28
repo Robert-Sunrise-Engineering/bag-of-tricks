@@ -20,7 +20,13 @@ import os
 from datetime import datetime
 
 from conflate.config import load_config, load_local_config, validate_layer_config
-from conflate.gis_client import connect, get_layer, validate_schema, validate_capabilities
+from conflate.gis_client import (
+    connect,
+    get_layer,
+    validate_schema,
+    validate_capabilities,
+    validate_geometry_type,
+)
 from conflate.paging import fetch_all_features
 from conflate.threshold import format_threshold_both_units
 from conflate.matching import find_candidates, pick_closest_unclaimed
@@ -30,20 +36,9 @@ from conflate.report import write_report
 from conflate.backup import write_backup
 from conflate.attachments import copy_attachments, target_attachment_name
 from conflate.apply import apply_updates, apply_appends
+from conflate.fields import EXCLUDED_FIELDS
 
 logger = logging.getLogger(__name__)
-
-# Fields that must never be written by null-fill or append payloads.
-EXCLUDED_FIELDS = {
-    "OBJECTID",
-    "GlobalID",
-    "Shape",
-    "SHAPE",
-    "Creator",
-    "CreationDate",
-    "Editor",
-    "EditDate",
-}
 
 
 def _simplify_feature(raw_feature: dict) -> dict:
@@ -60,6 +55,35 @@ def _simplify_feature(raw_feature: dict) -> dict:
     simplified["lon"] = geom.get("x")
     simplified["lat"] = geom.get("y")
     return simplified
+
+
+def _has_point_geometry(simplified_feature: dict) -> bool:
+    """True if a feature simplified by ``_simplify_feature`` has a usable
+    point location (lon and lat both non-None).
+
+    False for features with no geometry at all, or a non-point geometry
+    (line/polygon geometries have no "x"/"y" keys, so ``_simplify_feature``
+    leaves lon/lat as None for them). Used to filter such features out
+    before they reach geodesic_distance, which raises on None inputs.
+    """
+    return simplified_feature["lon"] is not None and simplified_feature["lat"] is not None
+
+
+def _seed_claimed_oids(ledger: dict) -> set:
+    """Return the set of authoritative OIDs already claimed by a prior run,
+    per the ledger's recorded ``authoritative_oid`` for each processed
+    captured feature.
+
+    Used to seed a run's one-to-one-matching guard so an authoritative
+    record claimed by a captured feature in a prior run stays off-limits to
+    a different, newly-captured feature this run -- not just within a
+    single run.
+    """
+    return {
+        entry["authoritative_oid"]
+        for entry in ledger.values()
+        if entry.get("authoritative_oid") is not None
+    }
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -119,6 +143,21 @@ def _report_path_for_backup(backup_path: str, report_dir: str) -> str:
     return os.path.join(report_dir, f"{stem}.csv")
 
 
+def _rollback_log_path(backup_path: str, report_dir: str, rollback_timestamp: str) -> str:
+    """Derive this rollback run's own audit log path from the backup it's
+    rolling back and the rollback's own timestamp.
+
+    Written alongside reports (no separate directory/CLI flag), named
+    <layer>_<apply_timestamp>_rollback_<rollback_timestamp>.json so it sorts
+    next to the run it's undoing and a re-run rollback doesn't collide, e.g.
+    backups/hydrants_20260725_100000.json, "20260725_143000" ->
+    reports/hydrants_20260725_100000_rollback_20260725_143000.json
+    """
+    base = os.path.basename(backup_path)
+    stem, _ext = os.path.splitext(base)
+    return os.path.join(report_dir, f"{stem}_rollback_{rollback_timestamp}.json")
+
+
 def _do_rollback(args) -> None:
     from conflate.rollback import rollback
 
@@ -136,6 +175,9 @@ def _do_rollback(args) -> None:
 
     ledger_path = os.path.join("state", f"{args.layer}.json")
 
+    rollback_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = _rollback_log_path(backup_path, args.report_dir, rollback_timestamp)
+
     logger.info(
         "Rolling back layer '%s' using backup=%s report=%s",
         args.layer,
@@ -149,6 +191,7 @@ def _do_rollback(args) -> None:
         ledger_path,
         expected_layer_name=args.layer,
         force=args.force,
+        log_path=log_path,
     )
     logger.info("Rollback complete.")
 
@@ -192,6 +235,8 @@ def main() -> None:
     validate_schema(captured_layer, captured_required_fields)
     validate_schema(authoritative_layer, authoritative_required_fields)
     validate_capabilities(authoritative_layer, layer_cfg["copy_attachments"])
+    validate_geometry_type(captured_layer)
+    validate_geometry_type(authoritative_layer)
 
     # --- Step 4: bulk-fetch both layers once ---
     logger.info("Fetching all captured features...")
@@ -214,7 +259,21 @@ def main() -> None:
     ledger = load_ledger(ledger_path)
 
     # Simplify authoritative features once; reused for every captured feature.
-    authoritative_simplified = [_simplify_feature(f) for f in authoritative_features_raw]
+    # Features with no geometry (or a non-point geometry, which has no x/y)
+    # yield lon/lat of None; excluded here rather than left in so a single
+    # bad/missing authoritative geometry can't reach geodesic_distance (which
+    # raises on None) and abort matching for every captured feature.
+    authoritative_simplified = [
+        f for f in (_simplify_feature(raw) for raw in authoritative_features_raw)
+        if _has_point_geometry(f)
+    ]
+    n_authoritative_no_geometry = len(authoritative_features_raw) - len(authoritative_simplified)
+    if n_authoritative_no_geometry:
+        logger.warning(
+            "Skipping %d authoritative feature(s) with no usable point geometry "
+            "(missing geometry, or a non-point geometry type).",
+            n_authoritative_no_geometry,
+        )
     # Map OBJECTID -> raw (unsimplified) authoritative feature, for real attribute
     # access (build_field_updates, backups) without the injected lon/lat keys.
     authoritative_by_oid = {
@@ -226,12 +285,17 @@ def main() -> None:
     planned_appends = []  # each: {"attributes":..., "geometry":..., "_captured_global_id":..., "_captured_oid":...}
     planned_rows = []  # for the report
 
-    # Authoritative OIDs already matched by an earlier captured feature this
-    # run. Enforces one-to-one matching: once claimed, a candidate is no
+    # Authoritative OIDs already matched by a captured feature, this run OR a
+    # prior one. Enforces one-to-one matching: once claimed, a candidate is no
     # longer eligible to be picked as the closest match for a later captured
     # feature (prevents two captured features from both updating the same
-    # authoritative record).
-    claimed_authoritative_oids = set()
+    # authoritative record). Seeded from the ledger (which records the
+    # authoritative_oid each already-processed captured feature was matched
+    # to) so the invariant holds across runs, not just within one -- otherwise
+    # a newly-captured feature within threshold of an already-claimed record
+    # could re-claim it on a later run and silently merge into it instead of
+    # being appended as its own feature.
+    claimed_authoritative_oids = _seed_claimed_oids(ledger)
 
     for raw_captured in captured_features_raw:
         captured_attrs = raw_captured.get("attributes", {})
@@ -246,6 +310,27 @@ def main() -> None:
         captured_simplified = _simplify_feature(raw_captured)
         captured_lon = captured_simplified["lon"]
         captured_lat = captured_simplified["lat"]
+
+        if not _has_point_geometry(captured_simplified):
+            # No usable point geometry (missing, or a non-point geometry
+            # type with no x/y) -- skip rather than let geodesic_distance
+            # raise on None and abort the whole run over one bad feature.
+            logger.warning(
+                "Skipping captured feature with no usable point geometry "
+                "(captured_global_id=%s)",
+                captured_global_id,
+            )
+            planned_rows.append(
+                {
+                    "captured_global_id": captured_global_id,
+                    "action": "skipped_no_geometry",
+                    "matched_authoritative_oid": None,
+                    "distance_m": None,
+                    "threshold_m": threshold_m,
+                    "layer": layer_name,
+                }
+            )
+            continue
 
         # 7b: find candidates in the bulk-fetched, already-simplified authoritative list
         candidates = find_candidates(
@@ -395,17 +480,20 @@ def main() -> None:
     outcome_rows = []
     copy_attachments_enabled = layer_cfg["copy_attachments"]
 
-    # 9c/9d: for updates
-    for planned, result in zip(planned_updates, update_results):
+    def _build_outcome_row(planned, result, *, action_label, ledger_action, target_oid, distance_m):
+        """Copy attachments (if enabled), ledger the feature if fully
+        successful, and build its outcome row -- shared by the update and
+        append loops below, which differ only in target_oid derivation,
+        action labels, and whether distance_m applies.
+        """
         captured_global_id = planned["_captured_global_id"]
         captured_oid = planned["_captured_oid"]
         success = result["success"]
-        target_oid = planned["_authoritative_oid"]
         attachments_status = None
         added_attachment_ids = []
 
         if success and copy_attachments_enabled:
-            attachments_status, already_copied_names, added_attachment_ids = copy_attachments(
+            attachments_status, _already_copied_names, added_attachment_ids = copy_attachments(
                 captured_layer,
                 captured_oid,
                 authoritative_layer,
@@ -417,89 +505,60 @@ def main() -> None:
             )
         elif success:
             attachments_status = "0/0"
-            added_attachment_ids = []
 
         ledgered = False
         if success and _attachments_fully_succeeded(attachments_status):
             mark_processed(
                 ledger,
                 captured_global_id,
-                "updated",
+                ledger_action,
                 target_oid,
                 attachments_status,
                 datetime.now().isoformat(),
             )
             ledgered = True
 
+        return {
+            "captured_global_id": captured_global_id,
+            # rollback.py filters on exactly "updated"/"appended" and reads
+            # the OID from "authoritative_oid" — keep these names in sync
+            # with conflate/rollback.py's expected report schema.
+            "action": action_label,
+            "authoritative_oid": target_oid,
+            "distance_m": distance_m,
+            "threshold_m": threshold_m,
+            "success": success,
+            "error": result["error"],
+            "attachments_status": attachments_status,
+            "attachments_added": json.dumps(added_attachment_ids),
+            "ledgered": ledgered,
+            "layer": layer_name,
+        }
+
+    # 9c/9d: for updates
+    for planned, result in zip(planned_updates, update_results):
         outcome_rows.append(
-            {
-                "captured_global_id": captured_global_id,
-                # rollback.py filters on exactly "updated"/"appended" and reads
-                # the OID from "authoritative_oid" — keep these names in sync
-                # with conflate/rollback.py's expected report schema.
-                "action": "updated",
-                "authoritative_oid": target_oid,
-                "distance_m": planned["_distance"],
-                "threshold_m": threshold_m,
-                "success": success,
-                "error": result["error"],
-                "attachments_status": attachments_status,
-                "attachments_added": json.dumps(added_attachment_ids),
-                "ledgered": ledgered,
-                "layer": layer_name,
-            }
+            _build_outcome_row(
+                planned,
+                result,
+                action_label="updated",
+                ledger_action="updated",
+                target_oid=planned["_authoritative_oid"],
+                distance_m=planned["_distance"],
+            )
         )
 
     # 9c/9d: for appends
     for planned, result in zip(planned_appends, append_results):
-        captured_global_id = planned["_captured_global_id"]
-        captured_oid = planned["_captured_oid"]
-        success = result["success"]
-        target_oid = result["result_oid"]
-        attachments_status = None
-        added_attachment_ids = []
-
-        if success and copy_attachments_enabled:
-            attachments_status, already_copied_names, added_attachment_ids = copy_attachments(
-                captured_layer,
-                captured_oid,
-                authoritative_layer,
-                target_oid,
-                captured_global_id,
-                already_copied=_existing_attachment_names(
-                    captured_layer, captured_oid, authoritative_layer, target_oid, captured_global_id
-                ),
-            )
-        elif success:
-            attachments_status = "0/0"
-            added_attachment_ids = []
-
-        ledgered = False
-        if success and _attachments_fully_succeeded(attachments_status):
-            mark_processed(
-                ledger,
-                captured_global_id,
-                "created",
-                target_oid,
-                attachments_status,
-                datetime.now().isoformat(),
-            )
-            ledgered = True
-
         outcome_rows.append(
-            {
-                "captured_global_id": captured_global_id,
-                "action": "appended",
-                "authoritative_oid": target_oid,
-                "distance_m": None,
-                "threshold_m": threshold_m,
-                "success": success,
-                "error": result["error"],
-                "attachments_added": json.dumps(added_attachment_ids),
-                "attachments_status": attachments_status,
-                "ledgered": ledgered,
-                "layer": layer_name,
-            }
+            _build_outcome_row(
+                planned,
+                result,
+                action_label="appended",
+                ledger_action="created",
+                target_oid=result["result_oid"],
+                distance_m=None,
+            )
         )
 
     # 9e: write the SAME-timestamped report with actual outcomes
@@ -559,10 +618,12 @@ def _existing_attachment_names(
     return expected_target_names & target_names
 
 
-def _attachments_fully_succeeded(status: str) -> bool:
+def _attachments_fully_succeeded(status: str | None) -> bool:
     """Parse an attachment status string like "2/3" and return whether it's fully successful.
 
-    "0/0" (no attachments to copy) counts as full success.
+    "0/0" (no attachments to copy) counts as full success. None -- returned by
+    copy_attachments when the source attachment list couldn't even be
+    retrieved -- is not a "n/n" string and so correctly falls through to False.
     """
     if not status:
         return False

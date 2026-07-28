@@ -46,7 +46,7 @@ def mark_processed(
     captured_global_id: str,
     action: str,
     authoritative_oid,
-    attachments_status: str,
+    attachments_status: str | None,
     run_time: str,
 ) -> None:
     """
@@ -59,7 +59,8 @@ def mark_processed(
         captured_global_id: The GlobalID of the captured feature.
         action: Action performed (e.g., "updated", "created", "skipped").
         authoritative_oid: OID from the authoritative source.
-        attachments_status: String describing attachment status (e.g., "2/3").
+        attachments_status: String describing attachment status (e.g., "2/3"),
+            or None if attachments were never attempted/couldn't be determined.
         run_time: ISO format timestamp of when the action was performed.
     """
     ledger[captured_global_id] = {

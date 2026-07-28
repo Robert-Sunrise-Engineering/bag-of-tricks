@@ -12,8 +12,11 @@ import logging
 
 from conflate.apply import apply_updates
 from conflate.backup import load_backup_meta
+from conflate.fields import EXCLUDED_FIELDS
 from conflate.ledger import load_ledger, save_ledger
 from conflate.attachments import delete_attachments_batch
+from conflate.run_log import write_rollback_log
+from conflate.verify import verify_restore
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +81,7 @@ def rollback(
     *,
     expected_layer_name=None,
     force=False,
+    log_path=None,
 ) -> None:
     """
     Undo a prior run's writes to ``layer`` using its backup and report.
@@ -136,6 +140,11 @@ def rollback(
     if expected_layer_name is not None:
         _check_layer_match(backup_meta, report_rows, expected_layer_name, force=force)
 
+    # Live count taken before any write, so the final count can be checked
+    # against the within-run expected delta (not against a cross-run
+    # baseline, which would be noisy in a live multi-editor AGOL org).
+    count_before = layer.query(where="1=1", return_count_only=True)
+
     # --- Step 1: build restores for updated rows ---
     restores = []
     for row in report_rows:
@@ -163,8 +172,21 @@ def rollback(
             )
             continue
 
+        # Exclude system/editor-tracking fields (GlobalID, Creator,
+        # CreationDate, Editor, EditDate, Shape/SHAPE) from the restored
+        # attributes -- the backup snapshot captured the full raw feature,
+        # but those fields are AGOL-managed and must never be written back,
+        # the same contract build_field_updates enforces for normal applies.
+        # OBJECTID is added back deliberately, to identify which record to
+        # restore.
+        restored_attrs = {
+            field: value
+            for field, value in backup_entry["attributes"].items()
+            if field not in EXCLUDED_FIELDS
+        }
+        restored_attrs["OBJECTID"] = oid
         restore = {
-            "attributes": {**backup_entry["attributes"], "OBJECTID": oid},
+            "attributes": restored_attrs,
             "geometry": backup_entry.get("geometry"),
         }
         restores.append(restore)
@@ -219,12 +241,16 @@ def rollback(
     # --- Step 4: Apply restores ---
     restore_success_count = 0
     restore_failure_count = 0
+    restore_results = []
     if restores:
         results = apply_updates(layer, restores)
         for result in results:
             input_ref = result.get("input_ref") or {}
             oid = input_ref.get("attributes", {}).get("OBJECTID")
-            if result.get("success"):
+            success = bool(result.get("success"))
+            error = result.get("error")
+            restore_results.append({"oid": oid, "success": success, "error": error})
+            if success:
                 restore_success_count += 1
                 logger.info("Restored OID %s to pre-edit state", oid)
             else:
@@ -233,13 +259,67 @@ def rollback(
                     "Failed to restore OID %s: %s", oid, result.get("error")
                 )
 
+    # --- Step 4b: Verify restored features against the live service ---
+    # apply_updates' success/failure above only reflects whether AGOL
+    # *accepted* the write; it says nothing about whether the live feature's
+    # attributes/geometry now actually match the backup. Best-effort and
+    # non-fatal (like the count check below): a verification hiccup must
+    # not appear to undo an already-completed, already-ledger-cleared
+    # rollback. Only checks OIDs the restore itself reported success for --
+    # a reported failure is already recorded and doesn't need re-verifying.
+    #
+    # verify_error distinguishes "verification ran and found N mismatches"
+    # from "verification itself blew up" -- without it, a crash here would
+    # log identical counts (0/0) to a run with nothing to verify, hiding a
+    # failure of the exact "silently treated as success" shape this check
+    # exists to catch in the first place.
+    verify_results = []
+    verify_success_count = 0
+    verify_mismatch_count = 0
+    verify_error = None
+    restored_oids = {r["oid"] for r in restore_results if r["success"]}
+    if restored_oids:
+        try:
+            verify_results = verify_restore(
+                layer, [backup_lookup[oid] for oid in restored_oids if oid in backup_lookup]
+            )
+            for vr in verify_results:
+                if vr["verified"]:
+                    verify_success_count += 1
+                else:
+                    verify_mismatch_count += 1
+                    logger.warning(
+                        "Post-restore verification mismatch for OID %s: "
+                        "live_feature_found=%s attribute_mismatches=%s geometry_mismatch_m=%s",
+                        vr["oid"],
+                        vr["live_feature_found"],
+                        vr["attribute_mismatches"],
+                        vr["geometry_mismatch_m"],
+                    )
+        except Exception as e:
+            verify_error = str(e)
+            verify_success_count = None
+            verify_mismatch_count = None
+            logger.error("Post-restore verification failed to run: %s", e)
+
     # --- Step 5: Delete attachments added during the run ---
     delete_attachments_success = 0
     delete_attachments_failed = 0
+    attachment_delete_results = []
+    total_attachments_targeted = sum(len(ids) for ids in attachments_to_remove.values())
     if attachments_to_remove:
         attachment_results = delete_attachments_batch(layer, attachments_to_remove)
         for ar in attachment_results:
             oid = ar.get("authoritative_oid")
+            for att_result in ar.get("results", []):
+                attachment_delete_results.append(
+                    {
+                        "oid": oid,
+                        "attachment_id": att_result.get("attachment_id"),
+                        "success": att_result.get("success"),
+                        "error": att_result.get("error"),
+                    }
+                )
             if ar.get("success"):
                 # Count successful deletions
                 error_count = len(ar.get("errors", []))
@@ -260,10 +340,12 @@ def rollback(
                     oid,
                     "; ".join(ar.get("errors", [])),
                 )
+    total_attachments_removed = sum(1 for r in attachment_delete_results if r["success"])
 
     # --- Step 6: Delete appended rows ---
     delete_feature_success_count = 0
     delete_feature_failure_count = 0
+    feature_delete_results = []
     if oids_to_delete:
         delete_result = layer.edit_features(deletes=oids_to_delete)
         delete_results = delete_result.get("deleteResults", [])
@@ -271,7 +353,10 @@ def rollback(
             oid = dr.get("objectId")
             if oid is None and i < len(oids_to_delete):
                 oid = oids_to_delete[i]
-            if dr.get("success"):
+            success = bool(dr.get("success"))
+            error = dr.get("error")
+            feature_delete_results.append({"oid": oid, "success": success, "error": error})
+            if success:
                 delete_feature_success_count += 1
                 logger.info("Deleted appended OID %s", oid)
             else:
@@ -281,6 +366,21 @@ def rollback(
                     oid,
                     dr.get("error"),
                 )
+
+    # Live count after all writes, checked against the within-run expected
+    # delta (restores don't change feature count; only feature deletes do).
+    count_after = layer.query(where="1=1", return_count_only=True)
+    expected_count_after = count_before - delete_feature_success_count
+    if count_after != expected_count_after:
+        logger.warning(
+            "Authoritative feature count after rollback (%d) does not match "
+            "the expected count (%d = %d before - %d deletes). Another "
+            "process may have modified this layer during the rollback.",
+            count_after,
+            expected_count_after,
+            count_before,
+            delete_feature_success_count,
+        )
 
     # --- Step 7: reset ledger entries for processed captured features ---
     ledger = load_ledger(ledger_path)
@@ -303,16 +403,56 @@ def rollback(
     save_ledger(ledger_path, ledger)
 
     # --- Final summary ---
+    # verify_success_count/verify_mismatch_count use %s (not %d): they're
+    # None, not 0, when verify_restore itself raised (see Step 4b) --
+    # formatting that case as "matched=0 mismatched=0" would read exactly
+    # like "nothing to verify", hiding the failure.
     logger.info(
         "Rollback complete: restores succeeded=%d failed=%d; "
+        "post-restore verify matched=%s mismatched=%s error=%s; "
         "attachment cleanup succeeded=%d failed=%d; "
         "feature deletes succeeded=%d failed=%d; "
         "ledger entries cleared for %d captured features",
         restore_success_count,
         restore_failure_count,
+        verify_success_count,
+        verify_mismatch_count,
+        verify_error,
         delete_attachments_success,
         delete_attachments_failed,
         delete_feature_success_count,
         delete_feature_failure_count,
         cleared_count,
     )
+
+    # --- Durable audit log (best-effort: a write failure here must not
+    # appear to undo the already-completed, already-ledger-cleared rollback) ---
+    if log_path is not None:
+        try:
+            write_rollback_log(
+                log_path,
+                layer=expected_layer_name if expected_layer_name is not None else backup_meta.get("layer"),
+                authoritative_url=backup_meta.get("authoritative_url"),
+                backup_path=str(backup_path),
+                report_path=str(report_path),
+                authoritative_feature_count_before=count_before,
+                authoritative_feature_count_after=count_after,
+                expected_feature_count_after=expected_count_after,
+                restore_results=restore_results,
+                feature_delete_results=feature_delete_results,
+                attachment_delete_results=attachment_delete_results,
+                total_attachments_targeted=total_attachments_targeted,
+                total_attachments_removed=total_attachments_removed,
+                restore_success_count=restore_success_count,
+                restore_failure_count=restore_failure_count,
+                delete_feature_success_count=delete_feature_success_count,
+                delete_feature_failure_count=delete_feature_failure_count,
+                ledger_cleared_count=cleared_count,
+                verify_results=verify_results,
+                verify_success_count=verify_success_count,
+                verify_mismatch_count=verify_mismatch_count,
+                verify_error=verify_error,
+            )
+            logger.info("Rollback log written to %s", log_path)
+        except Exception as e:
+            logger.error("Failed to write rollback log to %s: %s", log_path, e)

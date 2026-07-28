@@ -55,7 +55,11 @@ def copy_attachments(
 
     Returns:
         Tuple of (status_string, names_set, ids_list) where:
-        - status_string: String like "2/3" indicating count of copied attachments vs total
+        - status_string: String like "2/3" indicating count of copied attachments vs
+                    total, or None if the source attachment list couldn't even be
+                    retrieved (distinct from "0/0", which means the source
+                    genuinely has zero attachments — None means "unknown", so
+                    callers must not treat it as success).
         - names_set: Set of all target-side attachment names now on the target (old + new)
         - ids_list: List of target-layer attachment IDs newly uploaded in THIS call
                     (for rollback cleanup). Does not include already-copied attachments,
@@ -71,7 +75,13 @@ def copy_attachments(
         source_attachments = source_layer.attachments.get_list(source_oid)
     except Exception as e:
         logger.error(f"Failed to list attachments for source OID {source_oid}: {e}")
-        return (f"0/{0}", already_copied, [])
+        # None (not "0/0") is deliberate: "0/0" means "genuinely zero
+        # attachments to copy" and is treated as full success by
+        # _attachments_fully_succeeded, which would ledger this feature and
+        # skip it forever even though we never actually found out whether it
+        # has attachments. None is not a "n/n" string, so it's treated as
+        # not-fully-succeeded and the feature stays unledgered for retry.
+        return (None, already_copied, [])
 
     total_attachments = len(source_attachments)
     if total_attachments == 0:
@@ -201,21 +211,57 @@ def delete_attachments(target_layer, target_oid, attachment_ids_to_delete):
         attachment_ids_to_delete: List of attachment data IDs to delete
 
     Returns:
-        Dict with 'success' (bool) and 'errors' (list of str) keys
+        Dict with:
+        - 'success' (bool): overall success, unchanged semantics from before
+        - 'errors' (list of str): unchanged free-text error messages
+        - 'results' (list of dict): one entry per attachment_id in
+          attachment_ids_to_delete, each shaped
+          {"attachment_id": ..., "success": bool, "error": str | None}.
+          Parsed from AGOL's actual deleteAttachments response
+          (deleteAttachmentResults) rather than assuming success whenever no
+          exception was raised -- a server-side failure reported in that
+          response without an exception would otherwise be silently counted
+          as a success. Falls back to a failed entry with error
+          "unparsed response" if the response doesn't have the expected
+          shape, and to the caught exception's message if the call itself
+          raised.
     """
-    result = {"success": True, "errors": []}
+    result = {"success": True, "errors": [], "results": []}
 
     try:
         # Use AGOL's attachments API to delete each attachment
         for attachment_id in attachment_ids_to_delete:
             try:
-                target_layer.attachments.delete(target_oid, attachment_id)
-                logger.debug(f"Deleted attachment with ID {attachment_id} from OID {target_oid}")
+                response = target_layer.attachments.delete(target_oid, attachment_id)
+                delete_results = (response or {}).get("deleteAttachmentResults", [])
+                delete_result = delete_results[0] if delete_results else None
+
+                if delete_result is not None and "success" in delete_result:
+                    att_success = bool(delete_result["success"])
+                    att_error = None if att_success else str(delete_result.get("error"))
+                else:
+                    att_success = False
+                    att_error = "unparsed response"
+
+                if att_success:
+                    logger.debug(f"Deleted attachment with ID {attachment_id} from OID {target_oid}")
+                else:
+                    result["success"] = False
+                    error_msg = f"Failed to delete attachment ID {attachment_id}: {att_error}"
+                    logger.error(error_msg)
+                    result["errors"].append(error_msg)
+
+                result["results"].append(
+                    {"attachment_id": attachment_id, "success": att_success, "error": att_error}
+                )
             except Exception as e:
                 result["success"] = False
                 error_msg = f"Failed to delete attachment ID {attachment_id}: {e}"
                 logger.error(error_msg)
                 result["errors"].append(error_msg)
+                result["results"].append(
+                    {"attachment_id": attachment_id, "success": False, "error": str(e)}
+                )
     except Exception as e:
         result["success"] = False
         logger.error(f"Error deleting attachments from OID {target_oid}: {e}")

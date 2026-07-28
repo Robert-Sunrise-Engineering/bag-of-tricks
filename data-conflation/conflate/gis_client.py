@@ -140,3 +140,27 @@ def validate_capabilities(layer: FeatureLayer, copy_attachments: bool) -> None:
         raise ValueError(
             f"Layer is missing required capabilities: {', '.join(missing_capabilities)}"
         )
+
+
+def validate_geometry_type(layer: FeatureLayer) -> None:
+    """
+    Validate that a feature layer's geometry type is point.
+
+    Matching (geodesic_distance on a feature's x/y) only makes sense for
+    point features. A line/polygon layer has no single x/y and would
+    silently produce None lon/lat (see cli._simplify_feature), crashing
+    later deep inside geodesic_distance with an opaque error. Checking this
+    once at startup gives a clear, immediate error instead.
+
+    Args:
+        layer: FeatureLayer to validate
+
+    Raises:
+        ValueError: If the layer's geometry type is not esriGeometryPoint
+    """
+    geometry_type = layer.properties.get("geometryType", "")
+    if geometry_type != "esriGeometryPoint":
+        raise ValueError(
+            f"Layer geometry type is {geometry_type!r}, but this tool only "
+            "supports point layers (esriGeometryPoint)."
+        )

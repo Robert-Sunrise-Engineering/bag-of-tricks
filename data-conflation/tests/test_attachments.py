@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
-from conflate.attachments import copy_attachments, target_attachment_name
+from conflate.attachments import copy_attachments, target_attachment_name, delete_attachments
 
 CAPTURED_GLOBAL_ID = "{6cd37221-d36b-47cd-8078-5dc0cee3979f}"
 
@@ -296,9 +296,16 @@ class TestCopyAttachmentsEmptySource:
 class TestCopyAttachmentsGetListFailure:
     """Test behavior when getting attachment list fails."""
 
-    def test_get_list_failure_returns_zero_zero(self, mock_source_layer, mock_target_layer):
+    def test_get_list_failure_returns_none_not_zero_zero(self, mock_source_layer, mock_target_layer):
         """
-        If get_list fails, should return "0/0" and preserve already_copied.
+        If get_list fails, status must be None, NOT "0/0".
+
+        "0/0" is the sentinel for "genuinely zero attachments to copy", and
+        cli.py's _attachments_fully_succeeded("0/0") treats that as full
+        success and ledgers the feature -- permanently skipping it on future
+        runs. A transient listing failure (network blip, rate limit) must be
+        distinguishable from "nothing to do" so the feature stays unledgered
+        and gets retried.
         """
         source_oid = 100
         target_oid = 200
@@ -316,12 +323,28 @@ class TestCopyAttachmentsGetListFailure:
             already_copied=already_copied
         )
 
-        # Function should not raise; should return "0/0"
-        assert status == "0/0"
+        # Function should not raise; status must NOT be a "n/n" success string
+        assert status is None
 
         # already_copied should be preserved
         assert updated_set == {"old.jpg"}
         assert copied_ids == []
+
+    def test_get_list_failure_is_not_ledgered(self, mock_source_layer, mock_target_layer):
+        """
+        End-to-end through the same logic cli.py uses to decide whether to
+        ledger a feature: a get_list failure must NOT count as fully
+        succeeded, so the feature is retried on the next run.
+        """
+        from conflate.cli import _attachments_fully_succeeded
+
+        mock_source_layer.attachments.get_list.side_effect = Exception("Network error")
+
+        status, _updated_set, _copied_ids = copy_attachments(
+            mock_source_layer, 100, mock_target_layer, 200, CAPTURED_GLOBAL_ID, already_copied=None
+        )
+
+        assert _attachments_fully_succeeded(status) is False
 
 
 class TestCopyAttachmentsUploadFailure:
@@ -470,6 +493,82 @@ class TestCopyAttachmentsAlreadyCopiedSetImmutability:
             _expected_name(3, "c.jpg"),
         }
         assert sorted(copied_ids) == [901, 902, 903]
+
+
+class TestDeleteAttachments:
+    """Tests for delete_attachments's structured, response-parsed results."""
+
+    def test_success_response_reports_success_per_attachment(self):
+        """A clean deleteAttachmentResults response with success=True for every
+        id must produce a matching 'results' entry per id, not just rely on
+        the absence of an exception."""
+        layer = MagicMock()
+        layer.attachments.delete.side_effect = lambda oid, attachment_id: {
+            "deleteAttachmentResults": [{"objectId": attachment_id, "success": True}]
+        }
+
+        result = delete_attachments(layer, 42, [1, 2, 3])
+
+        assert result["success"] is True
+        assert result["errors"] == []
+        assert result["results"] == [
+            {"attachment_id": 1, "success": True, "error": None},
+            {"attachment_id": 2, "success": True, "error": None},
+            {"attachment_id": 3, "success": True, "error": None},
+        ]
+
+    def test_response_reports_server_side_failure_without_raising(self):
+        """A response where AGOL itself reports success=False (no exception
+        raised) must be recorded as a failure, not silently treated as
+        success -- this was the actual bug being fixed."""
+        layer = MagicMock()
+
+        def delete_side_effect(oid, attachment_id):
+            if attachment_id == 2:
+                return {
+                    "deleteAttachmentResults": [
+                        {"objectId": 2, "success": False, "error": "not found"}
+                    ]
+                }
+            return {"deleteAttachmentResults": [{"objectId": attachment_id, "success": True}]}
+
+        layer.attachments.delete.side_effect = delete_side_effect
+
+        result = delete_attachments(layer, 42, [1, 2, 3])
+
+        assert result["success"] is False
+        assert len(result["errors"]) == 1
+        assert result["results"] == [
+            {"attachment_id": 1, "success": True, "error": None},
+            {"attachment_id": 2, "success": False, "error": "not found"},
+            {"attachment_id": 3, "success": True, "error": None},
+        ]
+
+    def test_exception_recorded_as_failed_result(self):
+        """An exception calling delete() must still produce a 'results' entry
+        (not just an 'errors' string), so callers get a reliable per-id
+        result list to count against regardless of failure mode."""
+        layer = MagicMock()
+        layer.attachments.delete.side_effect = Exception("network error")
+
+        result = delete_attachments(layer, 42, [1])
+
+        assert result["success"] is False
+        assert result["results"] == [{"attachment_id": 1, "success": False, "error": "network error"}]
+
+    def test_unrecognized_response_shape_falls_back_to_failure(self):
+        """A response missing deleteAttachmentResults entirely (unexpected
+        shape) must not be assumed successful -- fall back to a failed
+        result with an explicit 'unparsed response' error."""
+        layer = MagicMock()
+        layer.attachments.delete.return_value = {"unexpected": "shape"}
+
+        result = delete_attachments(layer, 42, [1])
+
+        assert result["success"] is False
+        assert result["results"] == [
+            {"attachment_id": 1, "success": False, "error": "unparsed response"}
+        ]
 
 
 class TestCopyAttachmentsCrossFeatureCollision:
