@@ -22,7 +22,7 @@ other module:
 2. `gis_client.connect` → `get_layer` (both layers) → `validate_schema` / `validate_capabilities` / `validate_geometry_type` — connect to AGOL and fail fast on schema/capability/geometry problems.
 3. `paging.fetch_all_features` — bulk-fetch every feature from both layers, once each, always reprojected to WGS84 (`out_sr=4326`).
 4. `ledger.load_ledger` — load the layer's ledger; seed the cross-run "already claimed" authoritative OID set (`cli._seed_claimed_oids`) and the "already processed" captured-feature check (`ledger.is_processed`).
-5. Per unprocessed captured feature: `matching.find_candidates` (spatial + optional type filter, via `geometry.geodesic_distance` internally) → `matching.pick_closest_unclaimed` → either build an update via `nullfill.build_field_updates` (filtered by `fields.EXCLUDED_FIELDS`) or build an append.
+5. For the whole batch of unprocessed, point-geometry captured features at once: `matching.assign_matches` (global optimal assignment over `matching.find_candidates`/`pick_closest` per row, via `geometry.geodesic_distance` internally) — then per feature, either build an update via `nullfill.build_field_updates` (filtered by `fields.EXCLUDED_FIELDS`) or build an append.
 6. `threshold.format_threshold_both_units` — human-readable threshold for logging only.
 7. **Dry run**: `report.write_report` writes a "would_*" CSV. Stop here.
 8. **Apply**: `backup.write_backup` snapshots pre-edit authoritative state for every planned update, *before* any write. `apply.apply_updates` / `apply_appends` perform the actual AGOL writes. `attachments.copy_attachments` copies files (if configured) and `ledger.mark_processed` records success — but only if the write *and* (if enabled) the attachment copy both fully succeeded. `report.write_report` writes the outcomes CSV (this is what `rollback.py` later reads). `ledger.save_ledger` persists the ledger.
@@ -192,19 +192,32 @@ order.
   `(closest_candidate, closest_distance, all_candidates_with_distances_sorted)`
   — the third element is a list of `(candidate, distance)` tuples. Returns
   `(None, None, [])` if `candidates` is empty. No side effects.
-- **`pick_closest_unclaimed(candidates, captured_lon, captured_lat, claimed_oids: set) -> tuple`**
-  — Same as `pick_closest`, but skips any candidate whose `OBJECTID` is in
-  `claimed_oids`. Returns `(closest_unclaimed_candidate,
-  closest_unclaimed_distance, all_candidates_with_distances_sorted)` — the
-  first two are `(None, None)` if every candidate is claimed; the third
-  element is always the *full*, unfiltered sorted list regardless of claims.
-  No side effects.
 - **`find_candidates(authoritative_features, captured_feature, type_field_authoritative, type_field_captured, threshold_m) -> list[dict]`**
   — Filters `authoritative_features` to those within `threshold_m` meters of
   `captured_feature`'s coordinates. If both type-field arguments are given
   (non-`None`), also requires the type value to match exactly; if either is
   `None`, type is ignored and matching is purely spatial. Returned list
   order is unspecified. No side effects.
+- **`assign_matches(captured_features: list[dict], authoritative_features: list[dict], type_field_authoritative, type_field_captured, threshold_m: float) -> dict[int, dict]`**
+  — Solves the whole batch's captured-to-authoritative matching at once as a
+  global optimal assignment (`scipy.optimize.linear_sum_assignment`), rather
+  than resolving each captured feature independently and greedily (the
+  greedy approach this replaced, `pick_closest_unclaimed`, could silently
+  mismatch a systematically-offset cluster of features — see
+  `docs/2026-07-28-global-optimal-matching-design.md` for the full design
+  and worked examples). Internally calls `find_candidates`/`pick_closest`
+  per row to build a cost matrix with one dummy "append" column per row,
+  sized so maximizing real-match count always dominates minimizing distance
+  among them. Returns a dict keyed by each captured feature's *list index*
+  (not `GlobalID` — indices are guaranteed unique). Each value:
+  `"matched"` (bool), `"authoritative_feature"` (dict or `None`),
+  `"distance_m"` (float or `None`), `"candidates"` (nearest-first list of
+  `{"OBJECTID", "GlobalID", "distance_m"}` dicts for every authoritative
+  feature within threshold, regardless of what was assigned — plain Python,
+  not JSON-encoded), `"assignment_overridden_nearest"` (bool — true if the
+  assignment isn't simply the nearest candidate; always `False` for an
+  unmatched/appended row, meaning "not applicable," not "nearest was
+  chosen"). No side effects.
 
 ## `conflate/nullfill.py` — pure field-merge logic
 
@@ -444,7 +457,18 @@ silently breaks something else in the pipeline).
 
 Columns: `captured_global_id`, `action` (one of `would_update` /
 `would_append` / `skipped_no_geometry`), `matched_authoritative_oid`,
-`distance_m`, `threshold_m`, `layer`.
+`distance_m`, `threshold_m`, `candidates_json`, `assignment_overridden_nearest`,
+`layer`.
+
+`candidates_json` is a **JSON-encoded list** (never a bare `None`/missing
+cell, even for `skipped_no_geometry` rows, which get `"[]"`) of every
+authoritative feature within threshold of this captured feature, regardless
+of who it was actually assigned — `{"OBJECTID", "GlobalID", "distance_m"}`
+per entry, nearest-first. `assignment_overridden_nearest` is `True` when the
+assigned match (or lack of one) isn't simply the nearest entry in
+`candidates_json` — a quick-scan signal for reviewing close calls without
+parsing JSON in every row. Both come from `matching.assign_matches`; see
+`docs/2026-07-28-global-optimal-matching-design.md`.
 
 ### Apply report CSV
 
@@ -456,7 +480,11 @@ or empty if attachments weren't enabled), `attachments_added` (a
 **JSON-encoded list** of newly-added attachment IDs — encoded as a JSON
 string, not a raw Python list, because `csv.DictWriter` would otherwise
 stringify a list in a way that can't be parsed back), `ledgered` (bool),
-`layer`.
+`candidates_json`, `assignment_overridden_nearest` (same meaning as the
+dry-run columns above — **this report, not the dry-run one, is the only
+persisted artifact for a live `--apply` run**, since the dry-run report is
+never written when `--apply` is passed, so these two columns need to carry
+the same audit context here too), `layer`.
 
 **`rollback.py` depends on this exact schema**: it filters rows on
 `action == "updated"` / `action == "appended"`, reads `authoritative_oid` to
@@ -594,7 +622,7 @@ Read by `gis_client.connect`; see `config.local.json.example` and
 | `test_verify.py` | `verify.py` (`verify_restore`) |
 | `test_backup.py` | `backup.py` (`write_backup`, `load_backup`, `load_backup_meta`) |
 | `test_ledger.py` | `ledger.py` (`load_ledger`, `save_ledger`, `mark_processed`, `is_processed`) |
-| `test_matching.py` | `matching.py` (`pick_closest`, `pick_closest_unclaimed`, `find_candidates`), plus `geometry.geodesic_distance` |
+| `test_matching.py` | `matching.py` (`pick_closest`, `find_candidates`, `assign_matches`), plus `geometry.geodesic_distance` |
 | `test_nullfill.py` | `nullfill.py` (`is_null`, `build_field_updates`) |
 | `test_threshold.py` | `threshold.py` (`format_threshold_both_units`) |
 

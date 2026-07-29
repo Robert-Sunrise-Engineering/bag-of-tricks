@@ -295,3 +295,96 @@ class TestAttachmentFailureAsSuccess:
         ledger = _ledger(tmp_path)
         assert "{CAP-Y}" in ledger
         assert ledger["{CAP-Y}"]["action"] == "created"
+
+
+class TestNewMatchColumns:
+    """assign_matches()'s candidates_json/assignment_overridden_nearest must
+    appear in BOTH the dry-run report and the apply/outcome report. The
+    dry-run report is only ever written when --apply is not passed
+    (cli.py's main() returns immediately after writing it), so the outcome
+    report is the only persisted artifact for a live run -- if these columns
+    were dry-run-only, an applied run would carry zero audit context for its
+    own close calls."""
+
+    def _auth_and_captured(self):
+        auth_feature = {
+            "attributes": {"OBJECTID": 5, "GlobalID": "{AUTH-5}"},
+            "geometry": {"x": -122.0, "y": 45.0},
+        }
+        captured_match = {
+            # same point as auth_feature -> distance 0, matched, single candidate
+            "attributes": {"OBJECTID": 101, "GlobalID": "{CAP-MATCH}"},
+            "geometry": {"x": -122.0, "y": 45.0},
+        }
+        captured_append = {
+            # far from any authoritative feature -> no candidates, appended
+            "attributes": {"OBJECTID": 102, "GlobalID": "{CAP-APPEND}"},
+            "geometry": {"x": 10.0, "y": 10.0},
+        }
+        return auth_feature, captured_match, captured_append
+
+    def test_dry_run_report_carries_new_columns(self, monkeypatch, tmp_path):
+        auth_feature, captured_match, captured_append = self._auth_and_captured()
+        captured_no_geom = {
+            "attributes": {"OBJECTID": 103, "GlobalID": "{CAP-NOGEOM}"},
+            "geometry": None,
+        }
+
+        config = _base_layer_cfg()
+        clock = _Clock(datetime(2026, 1, 1, 10, 0, 0))
+
+        _run_main(
+            monkeypatch, tmp_path,
+            config=config,
+            auth_layer=FakeFeatureLayer([auth_feature]),
+            captured_layer=FakeFeatureLayer([captured_match, captured_append, captured_no_geom]),
+            clock=clock,
+            apply=False,
+        )
+
+        rows_by_gid = {r["captured_global_id"]: r for r in _latest_report_rows(tmp_path)}
+
+        matched_row = rows_by_gid["{CAP-MATCH}"]
+        assert matched_row["action"] == "would_update"
+        candidates = json.loads(matched_row["candidates_json"])
+        assert len(candidates) == 1
+        assert candidates[0]["OBJECTID"] == 5
+        assert matched_row["assignment_overridden_nearest"] == "False"
+
+        appended_row = rows_by_gid["{CAP-APPEND}"]
+        assert appended_row["action"] == "would_append"
+        assert json.loads(appended_row["candidates_json"]) == []
+        assert appended_row["assignment_overridden_nearest"] == "False"
+
+        no_geom_row = rows_by_gid["{CAP-NOGEOM}"]
+        assert no_geom_row["action"] == "skipped_no_geometry"
+        assert json.loads(no_geom_row["candidates_json"]) == []
+        assert no_geom_row["assignment_overridden_nearest"] == "False"
+
+    def test_outcome_report_carries_new_columns(self, monkeypatch, tmp_path):
+        auth_feature, captured_match, captured_append = self._auth_and_captured()
+
+        config = _base_layer_cfg()
+        clock = _Clock(datetime(2026, 1, 1, 10, 0, 0))
+
+        _run_main(
+            monkeypatch, tmp_path,
+            config=config,
+            auth_layer=FakeFeatureLayer([auth_feature]),
+            captured_layer=FakeFeatureLayer([captured_match, captured_append]),
+            clock=clock,
+            apply=True,
+        )
+
+        rows_by_gid = {r["captured_global_id"]: r for r in _latest_report_rows(tmp_path)}
+
+        matched_row = rows_by_gid["{CAP-MATCH}"]
+        assert matched_row["action"] == "updated"
+        candidates = json.loads(matched_row["candidates_json"])
+        assert len(candidates) == 1
+        assert candidates[0]["OBJECTID"] == 5
+        assert matched_row["assignment_overridden_nearest"] == "False"
+
+        appended_row = rows_by_gid["{CAP-APPEND}"]
+        assert appended_row["action"] == "appended"
+        assert json.loads(appended_row["candidates_json"]) == []

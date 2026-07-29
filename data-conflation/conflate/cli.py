@@ -29,7 +29,7 @@ from conflate.gis_client import (
 )
 from conflate.paging import fetch_all_features
 from conflate.threshold import format_threshold_both_units
-from conflate.matching import find_candidates, pick_closest_unclaimed
+from conflate.matching import assign_matches
 from conflate.nullfill import build_field_updates
 from conflate.ledger import load_ledger, save_ledger, mark_processed, is_processed
 from conflate.report import write_report
@@ -281,8 +281,8 @@ def main() -> None:
     }
 
     # --- Step 7: plan actions for each unprocessed captured feature ---
-    planned_updates = []  # each: {"attributes":..., "geometry":..., "_captured_global_id":..., "_captured_oid":..., "_authoritative_oid":..., "_distance":...}
-    planned_appends = []  # each: {"attributes":..., "geometry":..., "_captured_global_id":..., "_captured_oid":...}
+    planned_updates = []  # each: {"attributes":..., "geometry":..., "_captured_global_id":..., "_captured_oid":..., "_authoritative_oid":..., "_distance":..., "_candidates_json":..., "_assignment_overridden_nearest":...}
+    planned_appends = []  # each: {"attributes":..., "geometry":..., "_captured_global_id":..., "_captured_oid":..., "_candidates_json":..., "_assignment_overridden_nearest":...}
     planned_rows = []  # for the report
 
     # Authoritative OIDs already matched by a captured feature, this run OR a
@@ -297,19 +297,20 @@ def main() -> None:
     # being appended as its own feature.
     claimed_authoritative_oids = _seed_claimed_oids(ledger)
 
+    # 7a: filter to unprocessed, point-geometry captured features. Everything
+    # else is either skipped outright (already processed) or reported directly
+    # as skipped_no_geometry. valid_items pairs each surviving raw feature with
+    # its simplified form, in the same order assign_matches will index its
+    # per-row results by below.
+    valid_items = []
     for raw_captured in captured_features_raw:
         captured_attrs = raw_captured.get("attributes", {})
-        captured_geometry = raw_captured.get("geometry") or {}
         captured_global_id = captured_attrs.get("GlobalID")
-        captured_oid = captured_attrs.get("OBJECTID")
 
         if is_processed(ledger, captured_global_id):
             continue
 
-        # 7a: simplified captured feature dict (lon/lat + flattened attrs)
         captured_simplified = _simplify_feature(raw_captured)
-        captured_lon = captured_simplified["lon"]
-        captured_lat = captured_simplified["lat"]
 
         if not _has_point_geometry(captured_simplified):
             # No usable point geometry (missing, or a non-point geometry
@@ -327,31 +328,51 @@ def main() -> None:
                     "matched_authoritative_oid": None,
                     "distance_m": None,
                     "threshold_m": threshold_m,
+                    "candidates_json": json.dumps([]),
+                    "assignment_overridden_nearest": False,
                     "layer": layer_name,
                 }
             )
             continue
 
-        # 7b: find candidates in the bulk-fetched, already-simplified authoritative list
-        candidates = find_candidates(
-            authoritative_simplified,
-            captured_simplified,
-            type_field_authoritative,
-            type_field_captured,
-            threshold_m,
-        )
+        valid_items.append((raw_captured, captured_simplified))
 
-        # 7c: pick closest candidate not already claimed by an earlier captured
-        # feature this run (enforces one-to-one matching).
-        closest, distance, _all_sorted = pick_closest_unclaimed(
-            candidates, captured_lon, captured_lat, claimed_authoritative_oids
-        )
+    # 7b/7c: solve the whole batch at once as a global optimal assignment,
+    # instead of resolving each captured feature's match independently and
+    # greedily -- see docs/2026-07-28-global-optimal-matching-design.md for
+    # why greedy nearest-unclaimed can silently mismatch a
+    # systematically-offset cluster. match_results is indexed the same way as
+    # valid_items (list index, not GlobalID -- GlobalID isn't guaranteed
+    # non-null, index is unique by construction).
+    unclaimed_authoritative = [
+        f for f in authoritative_simplified
+        if f.get("OBJECTID") not in claimed_authoritative_oids
+    ]
+    match_results = assign_matches(
+        [simplified for _, simplified in valid_items],
+        unclaimed_authoritative,
+        type_field_authoritative,
+        type_field_captured,
+        threshold_m,
+    )
 
-        if closest is not None:
+    for i, (raw_captured, captured_simplified) in enumerate(valid_items):
+        captured_attrs = raw_captured.get("attributes", {})
+        captured_geometry = raw_captured.get("geometry") or {}
+        captured_global_id = captured_attrs.get("GlobalID")
+        captured_oid = captured_attrs.get("OBJECTID")
+
+        result = match_results[i]
+        candidates_json = json.dumps(result["candidates"])
+        assignment_overridden_nearest = result["assignment_overridden_nearest"]
+
+        if result["matched"]:
             # 7d: build an update action
-            authoritative_oid = closest.get("OBJECTID")
+            authoritative = result["authoritative_feature"]
+            distance = result["distance_m"]
+            authoritative_oid = authoritative.get("OBJECTID")
             claimed_authoritative_oids.add(authoritative_oid)
-            authoritative_global_id = closest.get("GlobalID")
+            authoritative_global_id = authoritative.get("GlobalID")
             authoritative_raw_attrs = authoritative_by_oid.get(authoritative_oid, {}).get(
                 "attributes", {}
             )
@@ -379,6 +400,8 @@ def main() -> None:
                     "_captured_oid": captured_oid,
                     "_authoritative_oid": authoritative_oid,
                     "_distance": distance,
+                    "_candidates_json": candidates_json,
+                    "_assignment_overridden_nearest": assignment_overridden_nearest,
                 }
             )
             planned_rows.append(
@@ -388,6 +411,8 @@ def main() -> None:
                     "matched_authoritative_oid": authoritative_oid,
                     "distance_m": distance,
                     "threshold_m": threshold_m,
+                    "candidates_json": candidates_json,
+                    "assignment_overridden_nearest": assignment_overridden_nearest,
                     "layer": layer_name,
                 }
             )
@@ -418,6 +443,8 @@ def main() -> None:
                     **append_action,
                     "_captured_global_id": captured_global_id,
                     "_captured_oid": captured_oid,
+                    "_candidates_json": candidates_json,
+                    "_assignment_overridden_nearest": assignment_overridden_nearest,
                 }
             )
             planned_rows.append(
@@ -427,6 +454,8 @@ def main() -> None:
                     "matched_authoritative_oid": None,
                     "distance_m": None,
                     "threshold_m": threshold_m,
+                    "candidates_json": candidates_json,
+                    "assignment_overridden_nearest": assignment_overridden_nearest,
                     "layer": layer_name,
                 }
             )
@@ -532,6 +561,8 @@ def main() -> None:
             "attachments_status": attachments_status,
             "attachments_added": json.dumps(added_attachment_ids),
             "ledgered": ledgered,
+            "candidates_json": planned.get("_candidates_json"),
+            "assignment_overridden_nearest": planned.get("_assignment_overridden_nearest"),
             "layer": layer_name,
         }
 

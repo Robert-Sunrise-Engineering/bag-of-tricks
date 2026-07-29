@@ -6,8 +6,16 @@ This test suite covers:
 """
 
 import pytest
-from conflate.matching import pick_closest, pick_closest_unclaimed, find_candidates
+from conflate.matching import pick_closest, find_candidates, assign_matches
 from conflate.geometry import geodesic_distance
+
+# meters-per-degree at the equator, used to build small lon/lat offsets that
+# reproduce specific real-world meter distances via the actual geodesic_distance
+_M_PER_DEG = 111320.0
+
+
+def _m(meters):
+    return meters / _M_PER_DEG
 
 
 class TestPickClosest:
@@ -66,64 +74,6 @@ class TestPickClosest:
         assert all_sorted[1][1] == pytest.approx(distance_a)
         # Confirm sorting: first distance < second distance
         assert all_sorted[0][1] < all_sorted[1][1]
-
-
-class TestPickClosestUnclaimed:
-    """Tests for pick_closest_unclaimed, which enforces one-to-one matching by
-    skipping candidates already claimed by an earlier captured feature this run."""
-
-    def test_empty_claimed_matches_pick_closest(self):
-        """With no claims, behaves identically to pick_closest."""
-        candidates = [
-            {"lon": 0.0001, "lat": 0.0, "OBJECTID": 1},
-            {"lon": 0.00001, "lat": 0.0, "OBJECTID": 2},
-        ]
-        closest, distance, all_sorted = pick_closest_unclaimed(candidates, 0.0, 0.0, set())
-        expected_closest, expected_distance, expected_all_sorted = pick_closest(
-            candidates, 0.0, 0.0
-        )
-
-        assert closest == expected_closest
-        assert distance == pytest.approx(expected_distance)
-        assert all_sorted == expected_all_sorted
-
-    def test_closest_already_claimed_falls_through_to_next(self):
-        """If the closest candidate is claimed, the next-closest unclaimed one wins."""
-        candidate_closest = {"lon": 0.00001, "lat": 0.0, "OBJECTID": 1}
-        candidate_next = {"lon": 0.0001, "lat": 0.0, "OBJECTID": 2}
-        candidates = [candidate_next, candidate_closest]
-
-        closest, distance, all_sorted = pick_closest_unclaimed(
-            candidates, 0.0, 0.0, claimed_oids={1}
-        )
-
-        assert closest == candidate_next
-        assert distance == pytest.approx(
-            geodesic_distance(0.0, 0.0, candidate_next["lon"], candidate_next["lat"])
-        )
-        # The full ranked list is unaffected by claims.
-        assert len(all_sorted) == 2
-        assert all_sorted[0][0] == candidate_closest
-
-    def test_all_candidates_claimed_returns_none(self):
-        """If every in-threshold candidate is already claimed, no match is returned."""
-        candidates = [
-            {"lon": 0.00001, "lat": 0.0, "OBJECTID": 1},
-            {"lon": 0.0001, "lat": 0.0, "OBJECTID": 2},
-        ]
-
-        closest, distance, all_sorted = pick_closest_unclaimed(
-            candidates, 0.0, 0.0, claimed_oids={1, 2}
-        )
-
-        assert closest is None
-        assert distance is None
-        assert len(all_sorted) == 2
-
-    def test_empty_candidates_returns_none(self):
-        """Empty candidate list behaves like pick_closest: (None, None, [])."""
-        closest, distance, all_sorted = pick_closest_unclaimed([], 0.0, 0.0, set())
-        assert (closest, distance, all_sorted) == (None, None, [])
 
 
 class TestFindCandidates:
@@ -428,3 +378,160 @@ class TestIntegration:
         assert len(all_sorted) == 2
         assert all_sorted[0][0]["id"] == "bridge_1"
         assert all_sorted[1][0]["id"] == "bridge_2"
+
+
+class TestAssignMatches:
+    """Tests for assign_matches, the global-optimal replacement for
+    pick_closest_unclaimed's greedy per-feature claiming.
+
+    Fixture coordinates reproduce (in real lon/lat degrees, via the actual
+    geodesic_distance -- not the flat-plane meters used in the design doc's
+    worked examples) the same two adversarial patterns documented in
+    docs/2026-07-28-global-optimal-matching-design.md.
+    """
+
+    def test_row_of_four_avoids_greedys_forced_spurious_append(self):
+        """Authoritative points 4m apart on a line, captured points each
+        shifted +3m along it. Greedy claiming (pick_closest_unclaimed,
+        processed in order) mismatches C1-C3 by one index each and leaves C4
+        unmatched -- despite every individual "match" looking clean (~1m,
+        comfortably under the 10.67m threshold) and C4 having a perfectly
+        good true match (A4, ~3m) that gets stolen. assign_matches must
+        instead return the true diagonal assignment: all 4 correct, ~3m
+        each, nobody appended.
+        """
+        threshold_m = 10.67
+
+        authoritative = [
+            {"lon": _m(i * 4), "lat": 0.0, "OBJECTID": i + 1, "GlobalID": f"A{i + 1}"}
+            for i in range(4)
+        ]
+        captured = [
+            {"lon": _m(i * 4 + 3), "lat": 0.0, "OBJECTID": 100 + i, "GlobalID": f"C{i + 1}"}
+            for i in range(4)
+        ]
+
+        results = assign_matches(captured, authoritative, None, None, threshold_m)
+
+        assert len(results) == 4
+        for i in range(4):
+            result = results[i]
+            assert result["matched"] is True, f"C{i + 1} should be matched, not appended"
+            assert result["authoritative_feature"]["GlobalID"] == f"A{i + 1}"
+            expected_distance = geodesic_distance(
+                captured[i]["lon"], captured[i]["lat"],
+                authoritative[i]["lon"], authoritative[i]["lat"],
+            )
+            assert result["distance_m"] == pytest.approx(expected_distance)
+            assert result["distance_m"] == pytest.approx(3.0, abs=0.01)
+
+    def test_diamond_true_match_not_nearest_still_wins_globally(self):
+        """A diamond of authoritative points (N/S/E/W), captured points each
+        shifted southeast. N_cap's and W_cap's true match is NOT their
+        nearest candidate (a wrong point is closer) -- greedy claiming would
+        grab that locally-tempting wrong match and cascade the damage onto
+        whichever row later loses its own true match. assign_matches must
+        still return the true diagonal assignment, since it's the unique
+        global-minimum-cost full assignment.
+        """
+        threshold_m = 30.0  # wide enough to keep every pairwise distance feasible
+
+        auth_points = {"N": (0, 10), "S": (0, -10), "E": (5, 0), "W": (-5, 0)}
+        shift = (7, -7)
+
+        authoritative = [
+            {"lon": _m(x), "lat": _m(y), "OBJECTID": i + 1, "GlobalID": name}
+            for i, (name, (x, y)) in enumerate(auth_points.items())
+        ]
+        captured = [
+            {
+                "lon": _m(x + shift[0]),
+                "lat": _m(y + shift[1]),
+                "OBJECTID": 100 + i,
+                "GlobalID": f"{name}_cap",
+            }
+            for i, (name, (x, y)) in enumerate(auth_points.items())
+        ]
+
+        results = assign_matches(captured, authoritative, None, None, threshold_m)
+
+        assert len(results) == 4
+        for i, (name, _) in enumerate(auth_points.items()):
+            result = results[i]
+            assert result["matched"] is True
+            assert result["authoritative_feature"]["GlobalID"] == name, (
+                f"{name}_cap should match its true counterpart {name}, "
+                "not a locally-closer wrong candidate"
+            )
+
+        # N_cap and W_cap: true match is NOT their nearest candidate --
+        # assignment_overridden_nearest must be True.
+        assert results[0]["assignment_overridden_nearest"] is True  # N_cap
+        assert results[3]["assignment_overridden_nearest"] is True  # W_cap
+
+        # S_cap and E_cap: true match IS already their nearest candidate --
+        # assignment_overridden_nearest must be False.
+        assert results[1]["assignment_overridden_nearest"] is False  # S_cap
+        assert results[2]["assignment_overridden_nearest"] is False  # E_cap
+
+    def test_empty_captured_features_returns_empty_dict(self):
+        """Test that assign_matches returns empty dict when captured_features is empty."""
+        result = assign_matches([], [{"lon": 0.0, "lat": 0.0, "OBJECTID": 1, "GlobalID": "A1"}], None, None, 10.0)
+        assert result == {}
+
+    def test_empty_authoritative_features_all_appended(self):
+        """Test that assign_matches returns unmatched entries when no authoritative features.
+
+        Build 3 captured features and call assign_matches with empty authoritative list.
+        Verify all are marked as unmatched with no candidates.
+        """
+        captured = [
+            {"lon": 0.0, "lat": 0.0, "OBJECTID": 100, "GlobalID": "C1"},
+            {"lon": _m(5), "lat": 0.0, "OBJECTID": 101, "GlobalID": "C2"},
+            {"lon": _m(10), "lat": 0.0, "OBJECTID": 102, "GlobalID": "C3"},
+        ]
+
+        results = assign_matches(captured, [], None, None, 10.0)
+
+        assert len(results) == 3
+        for i in range(3):
+            assert results[i]["matched"] is False
+            assert results[i]["authoritative_feature"] is None
+            assert results[i]["distance_m"] is None
+            assert results[i]["candidates"] == []
+
+    def test_type_field_exclusion_respected(self):
+        """Test that type field filtering excludes closer wrong-type candidates.
+
+        Build 1 captured feature with type "hydrant" and 2 authoritative features:
+        - one with matching type at 1m away
+        - one with wrong type at 0.5m away (closer!)
+
+        Verify the right-type candidate is matched, and the wrong-type is excluded
+        from the candidates list entirely (not just unmatched).
+        """
+        captured = [
+            {"lon": 0.0, "lat": 0.0, "OBJECTID": 100, "GlobalID": "C1", "type": "hydrant"}
+        ]
+
+        authoritative_wrong_type = {
+            "lon": _m(0.5), "lat": 0.0, "OBJECTID": 2, "GlobalID": "A2", "type": "valve"
+        }
+        authoritative_right_type = {
+            "lon": _m(1), "lat": 0.0, "OBJECTID": 1, "GlobalID": "A1", "type": "hydrant"
+        }
+
+        results = assign_matches(
+            captured,
+            [authoritative_wrong_type, authoritative_right_type],
+            "type",
+            "type",
+            10.0
+        )
+
+        assert len(results) == 1
+        assert results[0]["matched"] is True
+        assert results[0]["authoritative_feature"]["GlobalID"] == "A1"
+        # Candidates list should only have the right-type feature (length 1)
+        assert len(results[0]["candidates"]) == 1
+        assert results[0]["candidates"][0]["GlobalID"] == "A1"
