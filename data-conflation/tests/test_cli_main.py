@@ -13,10 +13,13 @@ with no real network/file dependencies.
 import csv
 import glob
 import json
+import logging
 import sys
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 import conflate.cli as cli
 
@@ -388,3 +391,681 @@ class TestNewMatchColumns:
         appended_row = rows_by_gid["{CAP-APPEND}"]
         assert appended_row["action"] == "appended"
         assert json.loads(appended_row["candidates_json"]) == []
+
+
+# ---------------------------------------------------------------------------
+# --auto-configure end-to-end tests
+# ---------------------------------------------------------------------------
+
+AUTH_SERVICE_URL = "https://example.com/arcgis/rest/services/Auth/FeatureServer"
+CAP_SERVICE_URL = "https://example.com/arcgis/rest/services/Captured/FeatureServer"
+
+
+def _sub(name, layer_id, geometry_type="esriGeometryPoint", *, side="A"):
+    """A sublayer dict in the shape list_service_sublayers returns. The url is
+    built from the side + id so auth/captured URLs are distinguishable."""
+    base = AUTH_SERVICE_URL if side == "A" else CAP_SERVICE_URL
+    return {"id": layer_id, "name": name, "geometry_type": geometry_type, "url": f"{base}/{layer_id}"}
+
+
+def _cal_feature(oid, lon, lat, **attrs):
+    """A raw AGOL feature dict for calibration tests -- point geometry plus
+    whatever extra attributes (e.g. a type field) the test needs."""
+    return {"attributes": {"OBJECTID": oid, "GlobalID": f"g{oid}", **attrs}, "geometry": {"x": lon, "y": lat}}
+
+
+def _run_auto_configure(
+    monkeypatch, tmp_path, *, auth_sublayers, cap_sublayers, existing_config,
+    threshold="10.67", no_copy_attachments=False, get_layer=None,
+    no_calibrate_thresholds=True,
+):
+    """Drive cli.main() through the --auto-configure path with fakes for every
+    AGOL touch point. Returns the dict captured by the patched save_config.
+
+    Calibration is off by default here (no_calibrate_thresholds=True) so
+    every pre-existing test in this module -- none of which fakes
+    fetch_all_features or a real-shaped get_layer -- keeps exercising
+    exactly the matching/merge behavior it was written for, undisturbed by
+    the calibration feature. Tests of calibration itself pass
+    no_calibrate_thresholds=False explicitly (see TestAutoConfigureCalibration)
+    and supply the extra fakes that path needs.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli, "load_local_config",
+        lambda path: {"portal_url": "https://example.com", "username": "u", "password": "p"},
+    )
+    monkeypatch.setattr(cli, "connect", lambda local_config: "fake-gis")
+
+    sublayers_by_url = {AUTH_SERVICE_URL: auth_sublayers, CAP_SERVICE_URL: cap_sublayers}
+    monkeypatch.setattr(cli, "list_service_sublayers", lambda gis, url: sublayers_by_url[url])
+
+    monkeypatch.setattr(cli, "load_config", lambda path: existing_config)
+
+    saved = {}
+
+    def fake_save(path, config):
+        saved["path"] = path
+        saved["config"] = config
+
+    monkeypatch.setattr(cli, "save_config", fake_save)
+
+    if get_layer is not None:
+        monkeypatch.setattr(cli, "get_layer", get_layer)
+
+    argv = ["conflate", "--auto-configure", AUTH_SERVICE_URL, CAP_SERVICE_URL,
+            "--default-threshold-m", threshold]
+    if no_copy_attachments:
+        argv.append("--no-copy-attachments")
+    if no_calibrate_thresholds:
+        argv.append("--no-calibrate-thresholds")
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.main()
+    return saved
+
+
+class TestAutoConfigure:
+    def test_adds_new_matching_point_layers(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("water_hydrants", 0), _sub("water_valves", 1)]
+        cap = [_sub("water_hydrants", 0, side="C"), _sub("water_valves", 1, side="C")]
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap, existing_config={"layers": {}},
+        )
+        layers = saved["config"]["layers"]
+        assert set(layers) == {"water_hydrants", "water_valves"}
+        assert layers["water_hydrants"]["authoritative_url"] == f"{AUTH_SERVICE_URL}/0"
+        assert layers["water_hydrants"]["captured_url"] == f"{CAP_SERVICE_URL}/0"
+        assert layers["water_hydrants"]["match_threshold_m"] == 10.67
+        assert layers["water_hydrants"]["copy_attachments"] is True
+        # Summary printed.
+        out = capsys.readouterr().out
+        assert "Added (2)" in out
+
+    def test_no_copy_attachments_flag_sets_false_on_new_entries(self, monkeypatch, tmp_path):
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, no_copy_attachments=True,
+        )
+        assert saved["config"]["layers"]["water_hydrants"]["copy_attachments"] is False
+
+    def test_unchanged_when_urls_already_match(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+        existing = {"layers": {"water_hydrants": {
+            "authoritative_url": f"{AUTH_SERVICE_URL}/0",
+            "captured_url": f"{CAP_SERVICE_URL}/0",
+            "match_threshold_m": 5.0, "field_map": {}, "copy_attachments": False,
+        }}}
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap, existing_config=existing,
+        )
+        # Unchanged: existing entry preserved verbatim (threshold stays 5.0, copy_attachments False).
+        assert saved["config"]["layers"]["water_hydrants"]["match_threshold_m"] == 5.0
+        assert saved["config"]["layers"]["water_hydrants"]["copy_attachments"] is False
+        out = capsys.readouterr().out
+        assert "Unchanged (1)" in out
+        assert "Added" not in out
+
+    def test_updates_shifted_sublayer_index(self, monkeypatch, tmp_path, capsys):
+        # The live service now exposes water_hydrants at index 3 (was 0).
+        auth = [_sub("water_hydrants", 3)]
+        cap = [_sub("water_hydrants", 3, side="C")]
+        existing = {"layers": {"water_hydrants": {
+            "authoritative_url": f"{AUTH_SERVICE_URL}/0",
+            "captured_url": f"{CAP_SERVICE_URL}/0",
+            "match_threshold_m": 5.0, "field_map": {}, "copy_attachments": False,
+        }}}
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap, existing_config=existing,
+        )
+        layer = saved["config"]["layers"]["water_hydrants"]
+        assert layer["authoritative_url"] == f"{AUTH_SERVICE_URL}/3"
+        assert layer["captured_url"] == f"{CAP_SERVICE_URL}/3"
+        # Non-URL fields untouched.
+        assert layer["match_threshold_m"] == 5.0
+        assert layer["copy_attachments"] is False
+        out = capsys.readouterr().out
+        assert "Updated (1)" in out
+        assert "water_hydrants" in out
+
+    def test_skips_non_point_and_geometry_mismatch(self, monkeypatch, tmp_path, capsys):
+        auth = [
+            _sub("point_lyr", 0),
+            _sub("polygon_lyr", 1, geometry_type="esriGeometryPolygon"),
+            _sub("mismatch_lyr", 2, geometry_type="esriGeometryPoint"),
+        ]
+        cap = [
+            _sub("point_lyr", 0, side="C"),
+            _sub("polygon_lyr", 1, side="C", geometry_type="esriGeometryPolygon"),
+            _sub("mismatch_lyr", 2, side="C", geometry_type="esriGeometryPolyline"),
+        ]
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap, existing_config={"layers": {}},
+        )
+        layers = saved["config"]["layers"]
+        assert set(layers) == {"point_lyr"}  # only the point-on-point pair emitted
+        out = capsys.readouterr().out
+        assert "Skipped (non-point geometry)" in out
+        assert "polygon_lyr" in out
+        assert "Skipped (geometry mismatch)" in out
+        assert "mismatch_lyr" in out
+
+    def test_unknown_geometry_resolved_via_get_layer(self, monkeypatch, tmp_path, capsys):
+        # Root summary omitted geometryType for both sides; a direct get_layer
+        # lookup resolves them to point.
+        auth = [_sub("unknown_lyr", 0, geometry_type=None)]
+        cap = [_sub("unknown_lyr", 0, side="C", geometry_type=None)]
+
+        class _ResolvedLayer:
+            def __init__(self, gis, url):
+                self.properties = {"geometryType": "esriGeometryPoint"}
+
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, get_layer=_ResolvedLayer,
+        )
+        assert "unknown_lyr" in saved["config"]["layers"]
+        out = capsys.readouterr().out
+        assert "Added (1)" in out
+
+    def test_unmatched_sides_reported(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("only_in_auth", 0)]
+        cap = [_sub("only_in_cap", 0, side="C")]
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap, existing_config={"layers": {}},
+        )
+        assert saved["config"]["layers"] == {}
+        out = capsys.readouterr().out
+        assert "Unmatched (authoritative only)" in out
+        assert "only_in_auth" in out
+        assert "Unmatched (captured only)" in out
+        assert "only_in_cap" in out
+
+    def test_case_insensitive_match_preserves_existing_lowercase_keys(self, monkeypatch, tmp_path, capsys):
+        # Real-world shape: live services use PascalCase sublayer names while
+        # existing config keys are lowercase snake_case, some with hand-curated
+        # type_field pairs. Must refresh in place (preserving type_field + key
+        # casing) and add only genuinely-new layers under their verbatim name.
+        auth = [
+            _sub("Water_Hydrants", 6),
+            _sub("Water_Network_Structures", 4),
+            _sub("Water_Pumps", 2),  # genuinely new
+        ]
+        cap = [
+            _sub("Water_Hydrants", 6, side="C"),
+            _sub("Water_Network_Structures", 4, side="C"),
+            _sub("Water_Pumps", 2, side="C"),
+        ]
+        existing = {
+            "layers": {
+                "water_hydrants": {
+                    "authoritative_url": f"{AUTH_SERVICE_URL}/6",
+                    "captured_url": f"{CAP_SERVICE_URL}/6",
+                    "match_threshold_m": 5.0, "field_map": {}, "copy_attachments": True,
+                },
+                "water_network_structures": {
+                    "authoritative_url": f"{AUTH_SERVICE_URL}/4",
+                    "captured_url": f"{CAP_SERVICE_URL}/4",
+                    "match_threshold_m": 5.0,
+                    "type_field_authoritative": "STRUCTTYPE",
+                    "type_field_captured": "STRUCTTYPE",
+                    "field_map": {}, "copy_attachments": True,
+                },
+            }
+        }
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap, existing_config=existing,
+        )
+        layers = saved["config"]["layers"]
+        # Existing keys preserved (lowercase), type_field pair intact.
+        assert "water_hydrants" in layers
+        assert "water_network_structures" in layers
+        assert layers["water_network_structures"]["type_field_authoritative"] == "STRUCTTYPE"
+        assert layers["water_network_structures"]["type_field_captured"] == "STRUCTTYPE"
+        # No PascalCase duplicates of existing layers.
+        assert "Water_Hydrants" not in layers
+        assert "Water_Network_Structures" not in layers
+        # Genuinely-new layer added under verbatim AGOL name.
+        assert "Water_Pumps" in layers
+        assert layers["Water_Pumps"]["authoritative_url"] == f"{AUTH_SERVICE_URL}/2"
+        out = capsys.readouterr().out
+        assert "Unchanged (2)" in out
+        assert "Added (1)" in out
+        assert "Water_Pumps" in out
+
+    def test_unknown_geometry_resolution_failure_does_not_abort(self, monkeypatch, tmp_path, capsys):
+        # A sublayer whose geometry type the root summary omitted, AND whose
+        # per-sublayer lookup then fails (network/404), must not abort the
+        # whole --auto-configure run -- the pair is skipped and the run
+        # completes, per the "one bad layer never aborts" contract.
+        auth = [_sub("water_hydrants", 0, geometry_type=None)]
+        cap = [_sub("water_hydrants", 0, geometry_type=None, side="C")]
+
+        def fake_get_layer(gis, url):
+            raise RuntimeError("simulated lookup failure")
+
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, get_layer=fake_get_layer,
+            no_calibrate_thresholds=True,
+        )
+        # Run completed (no exception); the unresolvable pair was not emitted.
+        assert saved["config"]["layers"] == {}
+        out = capsys.readouterr().out
+        assert "water_hydrants" in out
+
+
+class TestAutoConfigureCalibration:
+    """--auto-configure's default (--no-calibrate-thresholds not passed)
+    per-layer threshold calibration path. calibrate.py's own math is covered
+    by tests/test_calibrate.py; these tests are about cli.py's wiring:
+    which layers get fetched, what happens on failure, and that a resolved
+    threshold actually lands in the written config.
+    """
+
+    def test_new_layer_uses_calibrated_threshold(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+
+        auth_layer = FakeFeatureLayer([_cal_feature(1, 0.0, 0.0)])
+        cap_layer = FakeFeatureLayer([_cal_feature(1, 0.0001, 0.0001)])
+        layers_by_url = {f"{AUTH_SERVICE_URL}/0": auth_layer, f"{CAP_SERVICE_URL}/0": cap_layer}
+
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": 4.5, "confidence": "clear_bimodal_valley",
+                "n_samples": 1, "fraction_within_suggested": 1.0, "distance_summary": {},
+            },
+        )
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, get_layer=lambda gis, url: layers_by_url[url],
+            no_calibrate_thresholds=False,
+        )
+        assert saved["config"]["layers"]["water_hydrants"]["match_threshold_m"] == 4.5
+        out = capsys.readouterr().out
+        assert "Threshold calibrated (1)" in out
+        assert "water_hydrants: 4.50 m (clear_bimodal_valley)" in out
+
+    def test_unchanged_layer_skips_calibration_fetch(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+        existing = {"layers": {"water_hydrants": {
+            "authoritative_url": f"{AUTH_SERVICE_URL}/0",
+            "captured_url": f"{CAP_SERVICE_URL}/0",
+            "match_threshold_m": 5.0, "field_map": {}, "copy_attachments": True,
+        }}}
+        calls = []
+
+        def fake_get_layer(gis, url):
+            calls.append(url)
+            return FakeFeatureLayer([])
+
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config=existing, get_layer=fake_get_layer, no_calibrate_thresholds=False,
+        )
+        # An unchanged layer is never fetched for calibration -- this is
+        # what keeps a no-op re-run a true no-op.
+        assert calls == []
+        assert saved["config"]["layers"]["water_hydrants"]["match_threshold_m"] == 5.0
+        out = capsys.readouterr().out
+        assert "Threshold calibrated" not in out
+        assert "Threshold fallback" not in out
+
+    def test_calibration_exception_falls_back_to_default_threshold(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+
+        def fake_get_layer(gis, url):
+            raise RuntimeError("simulated network failure")
+
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, get_layer=fake_get_layer,
+            no_calibrate_thresholds=False, threshold="12.5",
+        )
+        # The run completes and the layer is still added -- one bad layer
+        # must not abort the whole --auto-configure run.
+        assert saved["config"]["layers"]["water_hydrants"]["match_threshold_m"] == 12.5
+        out = capsys.readouterr().out
+        assert "Threshold fallback to --default-threshold-m (1)" in out
+        assert "water_hydrants" in out
+
+    def test_insufficient_data_falls_back_to_default_threshold(self, monkeypatch, tmp_path, capsys):
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+        auth_layer = FakeFeatureLayer([_cal_feature(1, 0.0, 0.0)])
+        cap_layer = FakeFeatureLayer([_cal_feature(1, 0.0001, 0.0001)])
+        layers_by_url = {f"{AUTH_SERVICE_URL}/0": auth_layer, f"{CAP_SERVICE_URL}/0": cap_layer}
+
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": None, "confidence": "insufficient_data",
+                "n_samples": 1, "fraction_within_suggested": None, "distance_summary": None,
+            },
+        )
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, get_layer=lambda gis, url: layers_by_url[url],
+            no_calibrate_thresholds=False,
+        )
+        assert saved["config"]["layers"]["water_hydrants"]["match_threshold_m"] == 10.67
+        out = capsys.readouterr().out
+        assert "Threshold fallback to --default-threshold-m (1)" in out
+
+    def test_non_positive_suggestion_falls_back_to_default_threshold(self, monkeypatch, tmp_path, capsys):
+        # A calibrated value that rounds to <= 0 must never reach
+        # match_threshold_m -- it would collapse assign_matches's cost
+        # matrix (k=0) and silently accept arbitrary matches later.
+        auth = [_sub("water_hydrants", 0)]
+        cap = [_sub("water_hydrants", 0, side="C")]
+        auth_layer = FakeFeatureLayer([_cal_feature(1, 0.0, 0.0)])
+        cap_layer = FakeFeatureLayer([_cal_feature(1, 0.0001, 0.0001)])
+        layers_by_url = {f"{AUTH_SERVICE_URL}/0": auth_layer, f"{CAP_SERVICE_URL}/0": cap_layer}
+
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": 0.001, "confidence": "low_no_clear_bimodal_separation",
+                "n_samples": 1, "fraction_within_suggested": 1.0, "distance_summary": {},
+            },
+        )
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config={"layers": {}}, get_layer=lambda gis, url: layers_by_url[url],
+            no_calibrate_thresholds=False, threshold="9.5",
+        )
+        assert saved["config"]["layers"]["water_hydrants"]["match_threshold_m"] == 9.5
+        out = capsys.readouterr().out
+        assert "Threshold fallback to --default-threshold-m (1)" in out
+
+    def test_changed_layer_passes_existing_type_fields_to_nearest_distances(self, monkeypatch, tmp_path):
+        # water_hydrants' sublayer index shifted 0 -> 3 (a URL refresh);
+        # its hand-configured type_field pair must be reused for calibration.
+        auth = [_sub("water_hydrants", 3)]
+        cap = [_sub("water_hydrants", 3, side="C")]
+        existing = {"layers": {"water_hydrants": {
+            "authoritative_url": f"{AUTH_SERVICE_URL}/0",
+            "captured_url": f"{CAP_SERVICE_URL}/0",
+            "match_threshold_m": 5.0,
+            "type_field_authoritative": "STRUCTTYPE",
+            "type_field_captured": "STRUCTTYPE",
+            "field_map": {}, "copy_attachments": True,
+        }}}
+        auth_layer = FakeFeatureLayer([_cal_feature(1, 0.0, 0.0, STRUCTTYPE="hydrant")])
+        cap_layer = FakeFeatureLayer([_cal_feature(1, 0.0001, 0.0001, STRUCTTYPE="hydrant")])
+        layers_by_url = {f"{AUTH_SERVICE_URL}/3": auth_layer, f"{CAP_SERVICE_URL}/3": cap_layer}
+
+        real_nearest_distances = cli.nearest_distances
+        captured_call = {}
+
+        def spy_nearest_distances(captured_features, authoritative_features, tfa, tfc):
+            captured_call["type_field_authoritative"] = tfa
+            captured_call["type_field_captured"] = tfc
+            return real_nearest_distances(captured_features, authoritative_features, tfa, tfc)
+
+        monkeypatch.setattr(cli, "nearest_distances", spy_nearest_distances)
+
+        _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config=existing, get_layer=lambda gis, url: layers_by_url[url],
+            no_calibrate_thresholds=False,
+        )
+        assert captured_call["type_field_authoritative"] == "STRUCTTYPE"
+        assert captured_call["type_field_captured"] == "STRUCTTYPE"
+
+    def test_changed_layer_schema_shift_falls_back_and_still_refreshes_urls(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        # The URL changed AND the type field no longer exists on the new
+        # service -- validate_schema must catch this before nearest_distances
+        # ever runs a raw dict subscript on a missing key.
+        auth = [_sub("water_hydrants", 3)]
+        cap = [_sub("water_hydrants", 3, side="C")]
+        existing = {"layers": {"water_hydrants": {
+            "authoritative_url": f"{AUTH_SERVICE_URL}/0",
+            "captured_url": f"{CAP_SERVICE_URL}/0",
+            "match_threshold_m": 5.0,
+            "type_field_authoritative": "STRUCTTYPE",
+            "type_field_captured": "STRUCTTYPE",
+            "field_map": {}, "copy_attachments": True,
+        }}}
+        # Neither fake feature carries STRUCTTYPE.
+        auth_layer = FakeFeatureLayer([_cal_feature(1, 0.0, 0.0)])
+        cap_layer = FakeFeatureLayer([_cal_feature(1, 0.0001, 0.0001)])
+        layers_by_url = {f"{AUTH_SERVICE_URL}/3": auth_layer, f"{CAP_SERVICE_URL}/3": cap_layer}
+
+        saved = _run_auto_configure(
+            monkeypatch, tmp_path, auth_sublayers=auth, cap_sublayers=cap,
+            existing_config=existing, get_layer=lambda gis, url: layers_by_url[url],
+            no_calibrate_thresholds=False, threshold="12.5",
+        )
+        layer = saved["config"]["layers"]["water_hydrants"]
+        assert layer["authoritative_url"] == f"{AUTH_SERVICE_URL}/3"
+        # No resolved_threshold_m was attached (calibration never ran), so
+        # the existing threshold is preserved exactly as a plain URL refresh
+        # would leave it.
+        assert layer["match_threshold_m"] == 5.0
+        out = capsys.readouterr().out
+        # A changed (URL-refreshed) layer whose calibration fails keeps its
+        # existing threshold -- the summary must say so, not claim a fallback
+        # to --default-threshold-m (which only applies to genuinely-new layers).
+        assert "existing match_threshold_m preserved (1)" in out
+        assert "Threshold fallback to --default-threshold-m" not in out
+
+
+AUTH_URL_CAL = "https://example.com/arcgis/rest/services/Auth/FeatureServer/0"
+CAPTURED_URL_CAL = "https://example.com/arcgis/rest/services/Captured/FeatureServer/0"
+
+
+class TestCalibrateStandalone:
+    """The standalone --calibrate mode: recalibrate one already-configured
+    layer, writing back into config.json only with --apply.
+    """
+
+    def _run(self, monkeypatch, tmp_path, *, layer_cfg, auth_features, cap_features, apply=False, get_layer=None):
+        monkeypatch.chdir(tmp_path)
+        config = {"layers": {"water_hydrants": layer_cfg}}
+        monkeypatch.setattr(
+            cli, "load_local_config",
+            lambda path: {"portal_url": "https://example.com", "username": "u", "password": "p"},
+        )
+        monkeypatch.setattr(cli, "connect", lambda local_config: "fake-gis")
+        monkeypatch.setattr(cli, "load_config", lambda path: config)
+
+        auth_layer = FakeFeatureLayer(auth_features)
+        cap_layer = FakeFeatureLayer(cap_features)
+        layers_by_url = {
+            layer_cfg["authoritative_url"]: auth_layer,
+            layer_cfg["captured_url"]: cap_layer,
+        }
+        if get_layer is None:
+            get_layer = lambda gis, url: layers_by_url[url]
+        monkeypatch.setattr(cli, "get_layer", get_layer)
+
+        saved = {}
+
+        def fake_save(path, cfg):
+            saved["path"] = path
+            saved["config"] = cfg
+
+        monkeypatch.setattr(cli, "save_config", fake_save)
+
+        argv = ["conflate", "--calibrate", "--layer", "water_hydrants"]
+        if apply:
+            argv.append("--apply")
+        monkeypatch.setattr(sys, "argv", argv)
+        cli.main()
+        return saved
+
+    def _layer_cfg(self, **overrides):
+        cfg = {
+            "authoritative_url": AUTH_URL_CAL, "captured_url": CAPTURED_URL_CAL,
+            "match_threshold_m": 5.0, "field_map": {}, "copy_attachments": True,
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_dry_run_does_not_write_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": 6.25, "confidence": "clear_bimodal_valley",
+                "n_samples": 1, "fraction_within_suggested": 1.0, "distance_summary": {},
+            },
+        )
+        saved = self._run(
+            monkeypatch, tmp_path, layer_cfg=self._layer_cfg(),
+            auth_features=[_cal_feature(1, 0.0, 0.0)],
+            cap_features=[_cal_feature(1, 0.0001, 0.0001)],
+            apply=False,
+        )
+        assert saved == {}
+
+    def test_apply_writes_only_that_layers_threshold(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": 6.2543, "confidence": "clear_bimodal_valley",
+                "n_samples": 1, "fraction_within_suggested": 1.0, "distance_summary": {},
+            },
+        )
+        saved = self._run(
+            monkeypatch, tmp_path, layer_cfg=self._layer_cfg(),
+            auth_features=[_cal_feature(1, 0.0, 0.0)],
+            cap_features=[_cal_feature(1, 0.0001, 0.0001)],
+            apply=True,
+        )
+        layer = saved["config"]["layers"]["water_hydrants"]
+        assert layer["match_threshold_m"] == 6.25  # rounded to 2 decimals
+        # Every other field untouched.
+        assert layer["authoritative_url"] == AUTH_URL_CAL
+        assert layer["captured_url"] == CAPTURED_URL_CAL
+        assert layer["field_map"] == {}
+        assert layer["copy_attachments"] is True
+
+    def test_insufficient_data_does_not_write_even_with_apply(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": None, "confidence": "insufficient_data",
+                "n_samples": 0, "fraction_within_suggested": None, "distance_summary": None,
+            },
+        )
+        saved = self._run(
+            monkeypatch, tmp_path, layer_cfg=self._layer_cfg(),
+            auth_features=[], cap_features=[], apply=True,
+        )
+        assert saved == {}
+
+    def test_non_positive_suggestion_does_not_write_even_with_apply(self, monkeypatch, tmp_path):
+        # Same non-positive-threshold guard as --auto-configure: a rounded
+        # suggestion of <= 0 must never be written, even with --apply.
+        monkeypatch.setattr(
+            cli, "suggest_threshold",
+            lambda distances: {
+                "suggested_threshold_m": 0.001, "confidence": "low_no_clear_bimodal_separation",
+                "n_samples": 1, "fraction_within_suggested": 1.0, "distance_summary": {},
+            },
+        )
+        saved = self._run(
+            monkeypatch, tmp_path, layer_cfg=self._layer_cfg(),
+            auth_features=[_cal_feature(1, 0.0, 0.0)],
+            cap_features=[_cal_feature(1, 0.0001, 0.0001)],
+            apply=True,
+        )
+        assert saved == {}
+
+    def test_calibration_failure_logs_and_does_not_write(self, monkeypatch, tmp_path, caplog):
+        # A schema/network/fetch failure in _calibrate_layer_pair must surface
+        # as a clean error and leave config.json untouched, not a raw
+        # traceback -- the same robustness contract --auto-configure upholds.
+        def failing_get_layer(gis, url):
+            raise RuntimeError("simulated network failure")
+
+        with caplog.at_level(logging.ERROR, logger="conflate.cli"):
+            saved = self._run(
+                monkeypatch, tmp_path, layer_cfg=self._layer_cfg(),
+                auth_features=[_cal_feature(1, 0.0, 0.0)],
+                cap_features=[_cal_feature(1, 0.0001, 0.0001)],
+                apply=True, get_layer=failing_get_layer,
+            )
+        assert saved == {}
+        assert "Calibration failed for layer 'water_hydrants'" in caplog.text
+        assert "config.json not changed" in caplog.text
+
+
+class TestAutoConfigureArgparseValidation:
+    """argparse-level validation in main() must reject impossible flag combos."""
+
+    def _run_argv(self, monkeypatch, argv):
+        monkeypatch.setattr(sys, "argv", ["conflate"] + argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        return exc.value.code
+
+    def test_missing_threshold_errors(self, monkeypatch):
+        code = self._run_argv(monkeypatch, ["--auto-configure", "A", "C"])
+        assert code == 2
+
+    def test_layer_with_auto_configure_errors(self, monkeypatch):
+        code = self._run_argv(
+            monkeypatch,
+            ["--layer", "foo", "--auto-configure", "A", "C", "--default-threshold-m", "10.67"],
+        )
+        assert code == 2
+
+    def test_negative_threshold_errors(self, monkeypatch):
+        code = self._run_argv(
+            monkeypatch, ["--auto-configure", "A", "C", "--default-threshold-m", "-5"],
+        )
+        assert code == 2
+
+    def test_nan_threshold_errors(self, monkeypatch):
+        # NaN compares False against <= 0, so without an isfinite guard it
+        # would bypass the positivity check and land in config.json as a
+        # literal NaN token (distance <= NaN is always False -> nothing
+        # matches).
+        code = self._run_argv(
+            monkeypatch, ["--auto-configure", "A", "C", "--default-threshold-m", "nan"],
+        )
+        assert code == 2
+
+    def test_inf_threshold_errors(self, monkeypatch):
+        # inf likewise bypasses <= 0 and would make distance <= inf always
+        # True -- every captured feature matching every authoritative one.
+        code = self._run_argv(
+            monkeypatch, ["--auto-configure", "A", "C", "--default-threshold-m", "inf"],
+        )
+        assert code == 2
+
+    def test_auto_configure_with_rollback_errors(self, monkeypatch):
+        code = self._run_argv(
+            monkeypatch,
+            ["--auto-configure", "A", "C", "--default-threshold-m", "10.67", "--rollback", "b.json"],
+        )
+        assert code == 2
+
+    def test_no_layer_and_no_mode_errors(self, monkeypatch):
+        code = self._run_argv(monkeypatch, [])
+        assert code == 2
+
+    def test_calibrate_without_layer_errors(self, monkeypatch):
+        code = self._run_argv(monkeypatch, ["--calibrate"])
+        assert code == 2
+
+    def test_calibrate_with_rollback_errors(self, monkeypatch):
+        code = self._run_argv(monkeypatch, ["--calibrate", "--layer", "foo", "--rollback", "b.json"])
+        assert code == 2
+
+    def test_calibrate_with_auto_configure_errors(self, monkeypatch):
+        code = self._run_argv(
+            monkeypatch,
+            ["--auto-configure", "A", "C", "--default-threshold-m", "10.67", "--calibrate"],
+        )
+        assert code == 2

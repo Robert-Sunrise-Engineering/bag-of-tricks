@@ -1,7 +1,17 @@
 """GIS client module for connecting to ArcGIS Online and validating feature layers."""
 
+import logging
+import re
+
 from arcgis.gis import GIS
-from arcgis.features import FeatureLayer
+from arcgis.features import FeatureLayer, FeatureLayerCollection
+
+logger = logging.getLogger(__name__)
+
+# Matches a feature-service sublayer URL: a trailing `/<digits>` with an
+# optional slash, e.g. `.../FeatureServer/0` or `.../FeatureServer/0/`. A
+# service *root* URL ends at `.../FeatureServer` and must not match this.
+_SUBLAYER_URL_RE = re.compile(r"/\d+/?$")
 
 
 def connect(local_config: dict) -> GIS:
@@ -79,6 +89,21 @@ def get_layer(gis: GIS, url: str) -> FeatureLayer:
     return FeatureLayer(url, gis=gis)
 
 
+def _prop(entry, key, default=None):
+    """Read ``key`` from an entry that may be a plain dict or an
+    attribute-access object, i.e. ``entry[key]`` vs. ``entry.key``.
+
+    The arcgis library returns field/layer summary entries as plain dicts in
+    some contexts and as attribute-access objects in others (SDK/server
+    version dependent). Used by both ``validate_schema`` (field entries) and
+    ``list_service_sublayers`` (sublayer summary entries) so this shape
+    handling lives in one place.
+    """
+    if isinstance(entry, dict):
+        return entry.get(key, default)
+    return getattr(entry, key, default)
+
+
 def validate_schema(layer: FeatureLayer, required_fields: list[str]) -> None:
     """
     Validate that a feature layer has all required fields.
@@ -90,13 +115,9 @@ def validate_schema(layer: FeatureLayer, required_fields: list[str]) -> None:
     Raises:
         ValueError: If any required fields are missing from the layer
     """
-    # Get field names from the layer, handling both dict and object access patterns
-    layer_field_names = []
-    for field in layer.properties.fields:
-        if isinstance(field, dict):
-            layer_field_names.append(field["name"])
-        else:
-            layer_field_names.append(field.name)
+    # Get field names from the layer, handling both dict and object access
+    # patterns (see _prop below).
+    layer_field_names = [_prop(field, "name") for field in layer.properties.fields]
 
     # Find missing fields
     missing_fields = [f for f in required_fields if f not in layer_field_names]
@@ -148,7 +169,7 @@ def validate_geometry_type(layer: FeatureLayer) -> None:
 
     Matching (geodesic_distance on a feature's x/y) only makes sense for
     point features. A line/polygon layer has no single x/y and would
-    silently produce None lon/lat (see cli._simplify_feature), crashing
+    silently produce None lon/lat (see features.simplify_feature), crashing
     later deep inside geodesic_distance with an opaque error. Checking this
     once at startup gives a clear, immediate error instead.
 
@@ -164,3 +185,83 @@ def validate_geometry_type(layer: FeatureLayer) -> None:
             f"Layer geometry type is {geometry_type!r}, but this tool only "
             "supports point layers (esriGeometryPoint)."
         )
+
+
+def list_service_sublayers(gis: GIS, service_url: str) -> list[dict]:
+    """
+    Enumerate the spatial sublayers of a feature-service root URL.
+
+    Reads the lightweight root-service JSON (``FeatureLayerCollection.properties.layers``)
+    which already carries each sublayer's ``id``/``name``/``geometryType`` in a
+    single request -- it does not touch ``flc.layers`` (which lazily fetches
+    each sublayer) and excludes ``flc.properties.tables`` (non-spatial tables)
+    entirely. Generated sublayer URLs are built from the caller's own root URL
+    (not a resolved SDK URL) so they stay recognizable in config.json.
+
+    Args:
+        gis: Authenticated GIS object.
+        service_url: A feature-service *root* URL (ending at FeatureServer,
+            with no trailing ``/<id>`` sublayer index).
+
+    Returns:
+        One dict per spatial sublayer: ``{"id": int, "name": str,
+        "geometry_type": str | None, "url": str}``, in the order the service
+        lists them. ``geometry_type`` is ``None`` when the root summary didn't
+        include ``geometryType`` for that entry (server-version dependent);
+        no extra request is made to resolve it here -- the caller decides.
+
+    Raises:
+        ValueError: If ``service_url`` looks like a sublayer URL already
+            (trailing ``/<id>``) -- the exact hand-bookkeeping mistake this
+            function exists to make unnecessary.
+    """
+    if _SUBLAYER_URL_RE.search(service_url):
+        raise ValueError(
+            f"service_url {service_url!r} looks like a sublayer URL (trailing "
+            f"/<id>). Pass the feature-service root URL (ending at "
+            f"FeatureServer, no index) instead."
+        )
+
+    flc = FeatureLayerCollection(service_url, gis=gis)
+
+    table_ids = {_prop(t, "id") for t in (flc.properties.get("tables") or [])}
+    sublayers = []
+    for entry in flc.properties.get("layers") or []:
+        layer_id = _prop(entry, "id")
+        if layer_id is None:
+            # A sublayer without an id can't form a valid sublayer URL -- it
+            # would build '.../FeatureServer/None' and silently corrupt
+            # config.json. Skip it (with a warning) rather than emit a bad
+            # entry. (The geometry_type=None case below is allowed because the
+            # caller resolves it via a per-sublayer lookup; a None id has no
+            # such recourse.)
+            logger.warning(
+                "Skipping sublayer entry with no id in service summary: %r",
+                _prop(entry, "name"),
+            )
+            continue
+        if layer_id in table_ids:
+            # Defensive: tables normally live under .tables, not .layers, but
+            # don't emit a non-spatial table into a config bucket if a server
+            # ever lists it under both.
+            continue
+        name = _prop(entry, "name")
+        if name is None:
+            # An unnamed sublayer can't be matched by name (match_sublayers
+            # does name.lower()) -- skip it rather than let a None name
+            # propagate and AttributeError-abort the whole --auto-configure run.
+            logger.warning(
+                "Skipping sublayer entry (id %r) with no name in service "
+                "summary: it can't be matched by name.", layer_id,
+            )
+            continue
+        geometry_type = _prop(entry, "geometryType")
+        sublayers.append(
+            {
+                "id": layer_id,
+                "name": name,
+                "geometry_type": geometry_type,
+                "url": f"{service_url.rstrip('/')}/{layer_id}",
+            }
+        )
+    return sublayers
