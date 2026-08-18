@@ -155,6 +155,25 @@ stage-then-move design:
   tries the new cmdlet first and falls back to the old one automatically,
   so it works across host versions without a warning.
 
+### Known limitation: loose vendor API DLLs aren't copied
+
+The driver copy only stages folders under `DriverStore\FileRepository\`
+(that filter is what prevents a loose driver-file entry from making the
+script recurse-copy the entire guest `System32` tree). Some vendor API
+DLLs — e.g. `nvapi64.dll`, `nvml.dll` — live *outside* `FileRepository`
+(typically directly in `C:\Windows\System32` on the host). Those are
+**not** copied, and the script prints a `Skipping '...' - outside
+DriverStore\FileRepository` warning when it encounters them.
+
+Symptom: the GPU partition enumerates fine in guest Device Manager, but
+vendor-specific functionality (CUDA, NVENC, the NVIDIA control panel,
+etc.) fails. Fix: copy the missing DLLs into the guest's
+`C:\Windows\System32` manually (via `Copy-VMFile` into an unprotected
+folder, then move them into place with PowerShell Direct as the guest
+admin — same stage-then-move pattern the script uses for the driver
+folders). The exact file list varies by driver version and wasn't
+hard-coded here because it couldn't be verified without real hardware.
+
 
 Staging via `Copy-VMFile` only needs host permissions; the final move
 into the protected driver store happens under the guest's own admin
