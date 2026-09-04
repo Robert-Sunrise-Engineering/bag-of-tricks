@@ -39,6 +39,23 @@ via `attachments.delete_attachments_batch`, verifies the restored state
 against live AGOL via `verify.verify_restore`, clears the corresponding
 ledger entries, and writes a full audit log via `run_log.write_rollback_log`.
 
+**Auto-configure (`--auto-configure <auth_service_url> <captured_service_url>`):**
+`cli._do_auto_configure` enumerates both services' sublayers
+(`gis_client.list_service_sublayers`), matches them by name and buckets by
+geometry type (`autoconfig.match_sublayers`/`classify_matches`), then — unless
+`--no-calibrate-thresholds` — calibrates a `match_threshold_m` for every
+newly-added or URL-refreshed layer (`autoconfig.partition_point_matches`
+decides which; `cli._calibrate_layer_pair` does the fetch+calibrate, falling
+back to `--default-threshold-m` on any failure or an inconclusive result) before
+merging everything into `config.json` via `autoconfig.merge_layers_config` and
+printing a summary.
+
+**Calibrate (`--calibrate --layer <name> [--apply]`):** `cli._do_calibrate`
+recalibrates one already-configured layer the same way, via
+`cli._calibrate_layer_pair`, logging the current value, the suggestion, and
+diagnostics; writes `config.json` only with `--apply` (unlike auto-configure,
+which writes unconditionally).
+
 `fields.EXCLUDED_FIELDS` is the one constant shared across all three
 write-building code paths (`cli.py`'s update/append payloads,
 `rollback.py`'s restore payloads, `verify.py`'s comparison filtering),
@@ -54,18 +71,6 @@ nearly all the actual behavior lives in the underscore-prefixed helper
 functions below, not in `main()` itself — `main()` mostly just calls them in
 order.
 
-- **`_simplify_feature(raw_feature: dict) -> dict`** — Flattens an AGOL
-  feature (`{"attributes": {...}, "geometry": {...}}`) into one dict: all
-  attributes merged in, plus injected `lon`/`lat` keys from
-  `geometry["x"]`/`["y"]`. Since `fetch_all_features` always queries with
-  `out_sr=4326`, `lon`/`lat` are always WGS84 degrees when present. No side
-  effects.
-- **`_has_point_geometry(simplified_feature: dict) -> bool`** — `True` iff
-  both `lon` and `lat` are non-`None`. `False` for features with missing
-  geometry or a non-point geometry (lines/polygons have no `x`/`y`, so
-  `_simplify_feature` leaves `lon`/`lat` as `None`). Used to filter such
-  features out before they'd reach `geodesic_distance`, which raises on
-  `None` input.
 - **`_seed_claimed_oids(ledger: dict) -> set`** — Returns the set of
   `authoritative_oid` values recorded across all ledger entries. Used to
   seed the one-to-one matching guard so an authoritative record claimed in a
@@ -73,7 +78,8 @@ order.
 - **`_build_arg_parser() -> argparse.ArgumentParser`** — Builds the CLI's
   argument parser. See the README's flag table for the full flag list
   (`--layer`, `--apply`, `--rollback`, `--force`, `--backup-dir`,
-  `--report-dir`).
+  `--report-dir`, `--auto-configure`, `--default-threshold-m`,
+  `--no-copy-attachments`, `--no-calibrate-thresholds`, `--calibrate`).
 - **`_report_path_for_backup(backup_path: str, report_dir: str) -> str`** —
   Derives a run's report CSV path from its backup JSON path (same
   `<layer>_<timestamp>` stem, `report_dir` instead of the backup's
@@ -85,11 +91,51 @@ order.
   the backup/report/ledger/log paths, and delegates to
   `conflate.rollback.rollback(...)`. **Side effects:** network (AGOL
   connect), reads config files, delegates all further I/O to `rollback()`.
+- **`_fetch_simplified_points(layer) -> list[dict]`** — `fetch_all_features`
+  then `features.simplify_feature`/`features.has_point_geometry` filtering,
+  in one call. Used by `_calibrate_layer_pair`; `main()`'s normal-run path
+  applies the same two `features` functions inline rather than through this
+  helper. **Side effect:** network (bulk fetch).
+- **`_calibrate_layer_pair(gis, authoritative_url, captured_url, type_field_authoritative, type_field_captured) -> dict`**
+  — Fetches both sides of a layer pair and returns `calibrate.suggest_threshold`'s
+  result. Validates schema (`gis_client.validate_schema`) for the type
+  fields, if any, before fetching — `calibrate.nearest_distances` reads type
+  fields as direct dict subscripts, and a URL change is exactly the case
+  where a schema may have shifted. Shared by `_do_auto_configure` (new/
+  URL-refreshed layers) and `_do_calibrate` (one on-demand layer). **Raises**
+  on any failure (schema, network, fetch) rather than falling back itself —
+  callers decide how to handle that. **Side effects:** network (schema
+  checks + bulk fetch of both layers).
+- **`_do_auto_configure(args) -> None`** — Enumerates two feature services,
+  matches sublayers by name (`autoconfig.match_sublayers`/`classify_matches`),
+  and writes/refreshes `config.json` via `autoconfig.merge_layers_config`.
+  Unless `args.no_calibrate_thresholds`, calibrates a `match_threshold_m` for
+  every layer `autoconfig.partition_point_matches` classifies as `"new"` or
+  `"changed"` (never `"unchanged"`) via `_calibrate_layer_pair`, attaching the
+  result onto the match dict as `"resolved_threshold_m"` before merging; any
+  exception or an `"insufficient_data"` result falls back to
+  `args.default_threshold_m` instead of aborting the run. Prints a summary via
+  `_print_auto_configure_summary`. **Side effects:** network (sublayer
+  enumeration, optional geometry-type resolution, optional per-layer
+  calibration fetches), reads/writes `config.json`.
+- **`_print_auto_configure_summary(match_result, classified, merged, calibrated=(), threshold_fallbacks=()) -> None`**
+  — Prints (not logs) every non-empty bucket: Added/Updated/Unchanged,
+  Threshold calibrated (name, value, confidence), Threshold fallback (name,
+  reason), then the skip/ambiguous/unmatched sections.
+- **`_do_calibrate(args) -> None`** — Recalibrates one already-configured
+  `--layer`'s `match_threshold_m` via `_calibrate_layer_pair`, using that
+  layer's own `type_field_authoritative`/`type_field_captured` if set. Always
+  logs the current value, the suggestion, and diagnostics; only writes
+  `config.json` (rounded to 2 decimals) when `args.apply` is set and the
+  result isn't `"insufficient_data"`. **Side effects:** network (schema +
+  bulk fetch of both layers), reads `config.json`, writes it only with
+  `--apply`.
 - **`main() -> None`** — The full CLI workflow described in the architecture
-  overview above (dry run or `--apply`, or rollback dispatch). **Side
-  effects:** network calls to AGOL (query/edit/attachments), reads
-  `config.json`/`config.local.json`, reads/writes the ledger JSON, writes
-  backup JSON (apply only), writes the report CSV.
+  overview above (dry run, `--apply`, `--rollback`, `--auto-configure`, or
+  `--calibrate` dispatch). **Side effects:** network calls to AGOL
+  (query/edit/attachments), reads `config.json`/`config.local.json`,
+  reads/writes the ledger JSON, writes backup JSON (apply only), writes the
+  report CSV.
 - **`_existing_attachment_names(source_layer, source_oid, target_layer, target_oid, captured_global_id) -> set`**
   — Computes which target-side attachment names (per the deterministic
   naming scheme — see `attachments.target_attachment_name`) already exist on
@@ -114,6 +160,25 @@ order.
   fully successful, and builds its report row. See [Artifact
   schemas](#artifact-schemas) for the exact row shape it produces.
 
+## `conflate/features.py` — AGOL feature-shape helpers (pure)
+
+No `arcgis` import — consumes/produces only plain dicts. Shared by `cli.py`'s
+normal run, `_calibrate_layer_pair` (auto-configure calibration and standalone
+`--calibrate`), and nothing else.
+
+- **`simplify_feature(raw_feature: dict) -> dict`** — Flattens an AGOL
+  feature (`{"attributes": {...}, "geometry": {...}}`) into one dict: all
+  attributes merged in, plus injected `lon`/`lat` keys from
+  `geometry["x"]`/`["y"]`. Since `fetch_all_features` always queries with
+  `out_sr=4326`, `lon`/`lat` are always WGS84 degrees when present. No side
+  effects.
+- **`has_point_geometry(simplified_feature: dict) -> bool`** — `True` iff
+  both `lon` and `lat` are non-`None`. `False` for features with missing
+  geometry or a non-point geometry (lines/polygons have no `x`/`y`, so
+  `simplify_feature` leaves `lon`/`lat` as `None`). Used to filter such
+  features out before they'd reach `geodesic_distance`, which raises on
+  `None` input.
+
 ## `conflate/config.py` — config loading/validation
 
 - **`load_config(path) -> dict`** — Reads/parses a JSON file (`config.json`
@@ -126,6 +191,14 @@ order.
   `field_map`, `copy_attachments`) are present, and that
   `type_field_authoritative`/`type_field_captured` are given together or not
   at all. **Raises:** `ValueError` naming the missing/mismatched key(s).
+- **`save_config(path, config: dict) -> None`** — Writes `config` to JSON at
+  `path` with 2-space indent, atomically (temp file in the same directory +
+  `os.replace`). Byte-style is deterministic regardless of platform: CRLF
+  line endings, no trailing newline — byte-identical to the existing
+  `config.json`, so a no-op `--auto-configure` re-run produces a clean
+  `git diff` (the merge's "unchanged" bucket is meaningless otherwise).
+  **Raises:** whatever `json.dump`/`os.replace` raise; cleans up the temp
+  file on failure. **Side effect:** writes (and replaces) `path`.
 
 ## `conflate/gis_client.py` — AGOL connection & layer validation
 
@@ -156,8 +229,20 @@ order.
 - **`validate_geometry_type(layer: FeatureLayer) -> None`** — Raises unless
   `layer.properties["geometryType"] == "esriGeometryPoint"` — matching only
   supports point layers; a line/polygon layer would otherwise silently
-  produce `None` lon/lat deep inside `_simplify_feature` and crash later with
-  an opaque error. **Raises:** `ValueError`. **Side effect:** network call.
+  produce `None` lon/lat deep inside `features.simplify_feature` and crash
+  later with an opaque error. **Raises:** `ValueError`. **Side effect:**
+  network call.
+- **`list_service_sublayers(gis: GIS, service_url: str) -> list[dict]`** —
+  Enumerates a feature-service root URL's spatial sublayers from the
+  lightweight root-service JSON (`FeatureLayerCollection.properties.layers`),
+  one request, no per-sublayer fetch. Excludes `properties.tables`
+  (non-spatial). Each returned dict: `{"id", "name", "geometry_type",
+  "url"}` where `url` is built from the caller's root URL + id (not a resolved
+  SDK URL). `geometry_type` is `None` when the root summary omitted it (caller
+  resolves via `get_layer` if needed). **Raises:** `ValueError` up front if
+  `service_url` looks like a sublayer URL already (trailing `/<id>`) — the
+  exact hand-bookkeeping mistake this function exists to make unnecessary.
+  **Side effect:** one network call (root service JSON).
 
 ## `conflate/paging.py` — bulk fetch
 
@@ -218,6 +303,91 @@ order.
   assignment isn't simply the nearest candidate; always `False` for an
   unmatched/appended row, meaning "not applicable," not "nearest was
   chosen"). No side effects.
+
+## `conflate/autoconfig.py` — pure matching/merge logic for `--auto-configure`
+
+No `arcgis` import — consumes only the plain dicts `list_service_sublayers`
+returns and produces layer-config dicts `validate_layer_config` accepts.
+Follows the codebase's pure/AGOL-integration split (pure, like `matching.py`).
+
+- **`match_sublayers(authoritative_sublayers, captured_sublayers) -> dict`**
+  — Matches two services' sublayers by `name`, **case-insensitively**
+  (canonicalized with `name.lower()`), because AGOL `name` casing varies by
+  org (often PascalCase) while config keys are commonly lowercase snake_case.
+  Returns `{"matched", "auth_only", "captured_only", "ambiguous"}`. A name
+  repeated within one or both sides (case-insensitively) is `ambiguous` and
+  excluded from every other bucket. Each `matched` entry carries the
+  **authoritative side's verbatim** name as `name` (the system-of-record name,
+  used as the key for genuinely-new entries): `{"name",
+  "authoritative_url", "captured_url", "authoritative_geometry_type",
+  "captured_geometry_type"}`. No side effects.
+- **`classify_matches(matched: list[dict]) -> dict`** — Buckets matched pairs
+  by geometry type into `{"point", "non_point", "geometry_mismatch",
+  "unknown_geometry"}`. Only `point` (both sides `esriGeometryPoint`) is
+  emittable into config; `unknown_geometry` (either side's `geometry_type` is
+  `None`) is left for the caller to resolve via a per-sublayer lookup, then
+  re-bucket. No side effects.
+- **`partition_point_matches(existing_layers: dict, point_matches: list[dict]) -> dict`**
+  — The read-only classification half of `merge_layers_config` (which calls
+  this internally), pulled out so a caller — `cli._do_auto_configure` —  can
+  decide something *before* the actual merge (which layers are worth
+  fetching full feature sets for, to calibrate a threshold) without ever
+  classifying a match differently than the merge itself will. Same
+  case-insensitive existing-key lookup as `merge_layers_config`. Returns
+  `{"new", "changed", "unchanged"}`; entries in `"changed"`/`"unchanged"`
+  carry `"_existing_key"` (entries in `"new"` don't — there is none).
+  **Raises:** `ValueError` under the same collision condition as
+  `merge_layers_config`. No side effects.
+- **`build_layer_entry(match: dict, threshold_m: float, copy_attachments: bool) -> dict`**
+  — Builds a new `config.json` layer entry. Insertion order matches
+  config.json's existing convention (`authoritative_url`, `captured_url`,
+  `match_threshold_m`, `field_map`, `copy_attachments`) so new entries diff
+  cleanly next to refreshed ones; no `type_field_*` keys. The result is
+  passed through `validate_layer_config`. No side effects.
+- **`merge_layers_config(existing_layers: dict, point_matches: list[dict], default_threshold_m: float, copy_attachments: bool) -> dict`**
+  — Merges point matches into an existing `layers` dict, via
+  `partition_point_matches`. Only ever adds or refreshes — never deletes.
+  `"new"` → `build_layer_entry`, bucket `added`, threshold from the match's
+  `"resolved_threshold_m"` if present (rounded to 2 decimals) else
+  `default_threshold_m`. `"unchanged"` → left completely untouched (not even
+  threshold-checked), bucket `unchanged` — this is what keeps a no-op
+  `--auto-configure` re-run a true no-op. `"changed"` → refresh
+  `authoritative_url`/`captured_url` (preserving key order and every other
+  field, including any `type_field_*` pair), bucket `updated` with old→new
+  per changed field; `match_threshold_m` is refreshed too, and reported in
+  `changes`, **only if** the match carries a `"resolved_threshold_m"`
+  differing from the existing value — the one deliberate exception to
+  "refresh touches only URLs." Returns `{"layers", "added", "updated",
+  "unchanged"}`. No side effects (does not mutate its `existing_layers`
+  input).
+
+## `conflate/calibrate.py` — unsupervised per-layer threshold calibration (pure)
+
+No `arcgis` import — consumes only the plain simplified feature dicts
+`features.simplify_feature` produces. Shared by `cli._calibrate_layer_pair`,
+used from both `--auto-configure` and standalone `--calibrate`.
+
+- **`nearest_distances(captured_features, authoritative_features, type_field_authoritative, type_field_captured) -> list[float]`**
+  — For each captured feature, the geodesic distance to its nearest
+  type-matching authoritative feature, **unbounded** (no threshold) —
+  unlike `matching.find_candidates`, which only searches within the current
+  production threshold. Captured features with zero type-matching candidates
+  are skipped (logged, not errored). No side effects.
+- **`suggest_threshold(distances: list[float], min_samples: int = 8) -> dict`**
+  — Estimates a `match_threshold_m` from the shape of the distance
+  distribution: works in log-space, fits a `scipy.stats.gaussian_kde`, and
+  looks for a valley (`scipy.signal.find_peaks`) between the first two
+  peaks — a real dataset is typically bimodal (a tight cluster of true
+  correspondences plus a diffuse tail of unmatched features), and the valley
+  between the modes is the natural threshold. Falls back to a robust
+  `median + 3*MAD` statistic (marked low-confidence) when there are fewer
+  than `min_samples` distances, the KDE is degenerate, or no clear
+  two-peak-and-valley shape is found. Returns `{"suggested_threshold_m":
+  float | None, "confidence": "clear_bimodal_valley" |
+  "low_no_clear_bimodal_separation" | "insufficient_data", "n_samples",
+  "fraction_within_suggested", "distance_summary"}`;
+  `suggested_threshold_m` is `None` only for `"insufficient_data"`. No side
+  effects.
 
 ## `conflate/nullfill.py` — pure field-merge logic
 
@@ -561,7 +731,7 @@ single function signature:
   it's a standalone utility, not part of the active pipeline.
 - **Point geometry only.** `gis_client.validate_geometry_type` enforces this
   at startup for both layers; any non-point/missing-geometry feature
-  encountered later is skipped via `cli._has_point_geometry` rather than
+  encountered later is skipped via `features.has_point_geometry` rather than
   crashing the run.
 - **One-to-one match claiming persists across runs**, not just within one —
   via `cli._seed_claimed_oids` reading every ledger entry's
@@ -585,7 +755,7 @@ single function signature:
 |---|---|---|---|
 | `authoritative_url` | string | Yes | REST URL of the authoritative FeatureLayer. |
 | `captured_url` | string | Yes | REST URL of the captured FeatureLayer. |
-| `match_threshold_m` | number | Yes | Max geodesic distance (meters) for a match. |
+| `match_threshold_m` | number | Yes | Max geodesic distance (meters) for a match. Hand-set, or written by `--auto-configure` (calibrated per-layer by default, or `--default-threshold-m` if calibration is off/inconclusive) or `--calibrate --apply`. |
 | `field_map` | object | Yes (may be `{}`) | `{captured_field: authoritative_field}` for renamed fields. |
 | `copy_attachments` | bool | Yes | Requires the authoritative layer to have attachments enabled if `true`. |
 | `type_field_authoritative` | string | No | Must be paired with `type_field_captured`. |
@@ -613,10 +783,13 @@ Read by `gis_client.connect`; see `config.local.json.example` and
 
 | Test file | Module(s) covered |
 |---|---|
-| `test_gis_client.py` | `gis_client.py` (`validate_geometry_type`) |
+| `test_gis_client.py` | `gis_client.py` (`validate_geometry_type`, `list_service_sublayers`) |
+| `test_config.py` | `config.py` (`save_config`) |
+| `test_autoconfig.py` | `autoconfig.py` (`match_sublayers`, `classify_matches`, `partition_point_matches`, `build_layer_entry`, `merge_layers_config`, including `resolved_threshold_m` handling) |
+| `test_calibrate.py` | `calibrate.py` (`nearest_distances`, `suggest_threshold`) |
 | `test_attachments.py` | `attachments.py` |
-| `test_cli.py` | `cli.py`'s pure helpers (`_simplify_feature`, `_has_point_geometry`, `_attachments_fully_succeeded`, `_seed_claimed_oids`) |
-| `test_cli_main.py` | `cli.py`'s `main()` end-to-end, via a fake feature layer (no real network) |
+| `test_cli.py` | `cli.py`'s pure helpers (`_attachments_fully_succeeded`, `_seed_claimed_oids`); `features.py` (`simplify_feature`, `has_point_geometry`) |
+| `test_cli_main.py` | `cli.py`'s `main()` end-to-end, via a fake feature layer (no real network); also `--auto-configure` end-to-end (including default per-layer threshold calibration and its fallback paths) and standalone `--calibrate` end-to-end, plus argparse validation for both |
 | `test_rollback.py` | `rollback.py` (`rollback`, `LayerMismatchError`) |
 | `test_run_log.py` | `run_log.py` (`write_rollback_log`) |
 | `test_verify.py` | `verify.py` (`verify_restore`) |
@@ -626,9 +799,9 @@ Read by `gis_client.connect`; see `config.local.json.example` and
 | `test_nullfill.py` | `nullfill.py` (`is_null`, `build_field_updates`) |
 | `test_threshold.py` | `threshold.py` (`format_threshold_both_units`) |
 
-`config.py`, `paging.py`, `apply.py`, `report.py`, and `fields.py` have no
-dedicated test file of their own; their behavior is exercised indirectly
-through `test_cli_main.py`'s end-to-end run.
+`paging.py`, `apply.py`, `report.py`, and `fields.py` have no dedicated test
+file of their own; their behavior is exercised indirectly through
+`test_cli_main.py`'s end-to-end run.
 
 ---
 
@@ -643,6 +816,9 @@ Common modification scenarios and the file(s) to touch:
 | Add/change a system field that must never be written | `conflate/fields.py` (used by `cli.py`, `rollback.py`, `verify.py`) |
 | Change attachment naming/copy/delete behavior | `conflate/attachments.py` + `tests/test_attachments.py` |
 | Add a new CLI flag or change argument parsing | `conflate/cli.py`'s `_build_arg_parser` + `tests/test_cli.py` |
+| Change `--auto-configure` matching/merge rules | `conflate/autoconfig.py` + `tests/test_autoconfig.py` (pure); `conflate/cli.py`'s `_do_auto_configure` for the AGOL wiring (sublayer enumeration via `gis_client.list_service_sublayers`) |
+| Change threshold-calibration math (valley detection, MAD fallback) | `conflate/calibrate.py` + `tests/test_calibrate.py` (pure) |
+| Change when/how `--auto-configure`/`--calibrate` calibrate or fall back | `conflate/cli.py`'s `_calibrate_layer_pair`, `_do_auto_configure`, `_do_calibrate` + `tests/test_cli_main.py` |
 | Change the apply/dry-run report's columns | `conflate/cli.py`'s `main()`/`_build_outcome_row` — remember `rollback.py` depends on the exact column names (see [Artifact schemas](#artifact-schemas)) |
 | Add a new rollback safety check | `conflate/rollback.py`'s `_check_layer_match` (or a new guard alongside it) + `tests/test_rollback.py` |
 | Change post-restore verification tolerance/logic | `conflate/verify.py` + `tests/test_verify.py` |

@@ -1,33 +1,30 @@
 """Tests for conflate.cli helpers.
 
-Covers _simplify_feature/_has_point_geometry (the null/non-point geometry
-guard) and _attachments_fully_succeeded (the attachment-status ledgering
-decision), without exercising main()'s full AGOL-connected pipeline.
+Covers _attachments_fully_succeeded (the attachment-status ledgering
+decision) and _seed_claimed_oids, without exercising main()'s full
+AGOL-connected pipeline. simplify_feature/has_point_geometry (the
+null/non-point geometry guard) live in conflate.features.
 """
 
-from conflate.cli import (
-    _simplify_feature,
-    _has_point_geometry,
-    _attachments_fully_succeeded,
-    _seed_claimed_oids,
-)
+from conflate.cli import _attachments_fully_succeeded, _seed_claimed_oids
+from conflate.features import simplify_feature, has_point_geometry
 
 
 class TestHasPointGeometry:
     def test_point_feature_has_geometry(self):
         raw = {"attributes": {"GlobalID": "g1"}, "geometry": {"x": 1.0, "y": 2.0}}
-        simplified = _simplify_feature(raw)
-        assert _has_point_geometry(simplified) is True
+        simplified = simplify_feature(raw)
+        assert has_point_geometry(simplified) is True
 
     def test_missing_geometry_key_has_no_geometry(self):
         raw = {"attributes": {"GlobalID": "g1"}}
-        simplified = _simplify_feature(raw)
-        assert _has_point_geometry(simplified) is False
+        simplified = simplify_feature(raw)
+        assert has_point_geometry(simplified) is False
 
     def test_null_geometry_has_no_geometry(self):
         raw = {"attributes": {"GlobalID": "g1"}, "geometry": None}
-        simplified = _simplify_feature(raw)
-        assert _has_point_geometry(simplified) is False
+        simplified = simplify_feature(raw)
+        assert has_point_geometry(simplified) is False
 
     def test_non_point_geometry_has_no_geometry(self):
         """A polyline/polygon geometry (rings/paths, no x/y) must be treated
@@ -37,13 +34,13 @@ class TestHasPointGeometry:
             "attributes": {"GlobalID": "g1"},
             "geometry": {"paths": [[[0.0, 0.0], [1.0, 1.0]]]},
         }
-        simplified = _simplify_feature(raw)
-        assert _has_point_geometry(simplified) is False
+        simplified = simplify_feature(raw)
+        assert has_point_geometry(simplified) is False
 
     def test_partial_geometry_missing_y_has_no_geometry(self):
         raw = {"attributes": {"GlobalID": "g1"}, "geometry": {"x": 1.0}}
-        simplified = _simplify_feature(raw)
-        assert _has_point_geometry(simplified) is False
+        simplified = simplify_feature(raw)
+        assert has_point_geometry(simplified) is False
 
 
 class TestSeedClaimedOids:

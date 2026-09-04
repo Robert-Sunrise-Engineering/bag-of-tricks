@@ -31,6 +31,11 @@ The tool reads two JSON config files from the current working directory:
 `config.json` (which layers to conflate, tracked in git) and
 `config.local.json` (AGOL credentials, **not** tracked in git).
 
+`config.json` layer entries can be hand-written as below **or** generated and
+refreshed automatically from two feature-service root URLs via
+`--auto-configure` (see [Usage](#auto-configure)) — which exists precisely so
+you don't have to look up each sublayer index and paste both URLs by hand.
+
 ### `config.json`
 
 A top-level `"layers"` object maps a layer name — used as the CLI's
@@ -111,17 +116,24 @@ credentials:
 
 ## Usage
 
-The tool has a single entry point, `conflate_main.py`, with three modes of
+The tool has a single entry point, `conflate_main.py`, with five modes of
 operation selected by flags:
 
 ```
 python conflate_main.py --layer <name> [--apply] [--rollback BACKUP_FILE [--force]] [--backup-dir backups] [--report-dir reports]
+python conflate_main.py --auto-configure <AUTHORITATIVE_SERVICE_URL> <CAPTURED_SERVICE_URL> --default-threshold-m <m> [--no-copy-attachments] [--no-calibrate-thresholds]
+python conflate_main.py --calibrate --layer <name> [--apply]
 ```
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
-| `--layer` | Yes | — | Layer name/key from `config.json`'s `"layers"` object. |
-| `--apply` | No | off | Without it: dry run only. With it: perform real writes to AGOL. |
+| `--layer` | Yes (normal, rollback & calibrate) | — | Layer name/key from `config.json`'s `"layers"` object. Not used with `--auto-configure`. |
+| `--apply` | No | off | Without it: dry run only. With it: perform real writes (normal mode) or write the recalibrated threshold (`--calibrate` mode). |
+| `--auto-configure <AUTH_SERVICE_URL> <CAP_SERVICE_URL>` | No | — | Enumerate two feature-service root URLs, match sublayers by exact `name`, and write/refresh `config.json` entries for the point-on-point matches. Mutually exclusive with `--layer`/`--rollback`/`--calibrate`. See [Auto-configure](#auto-configure). |
+| `--default-threshold-m` | Yes (with `--auto-configure`) | — | Match threshold (meters) used for a newly-added layer entry when threshold calibration doesn't run or doesn't produce a confident suggestion. |
+| `--no-copy-attachments` | No | off | With `--auto-configure`: set `copy_attachments=false` on newly-added entries (defaults to `true`). Only affects new entries. |
+| `--no-calibrate-thresholds` | No | off | With `--auto-configure`: skip per-layer threshold calibration and apply `--default-threshold-m` to every newly-added layer instead (the old, metadata-only, no-feature-fetch behavior). See [Auto-configure](#auto-configure). |
+| `--calibrate` | No | off | Recalibrate `--layer`'s `match_threshold_m` from its current nearest-neighbor distance distribution instead of a normal run. Mutually exclusive with `--auto-configure`/`--rollback`. See [Calibrate](#calibrate). |
 | `--rollback BACKUP_FILE` | No | — | Path to a backup JSON file from a prior `--apply` run. If given, undoes that run instead of doing a normal conflation run. |
 | `--force` | No | off | Only relevant with `--rollback`: bypasses the layer-identity safety check for a legacy backup/report that predates it. See [Safety notes](#safety-notes--troubleshooting). |
 | `--backup-dir` | No | `backups` | Directory to write (apply) / read (rollback) backup JSON files. |
@@ -159,6 +171,111 @@ features to their pre-edit snapshot, deletes features that were appended,
 removes attachments that were copied during that run, clears the
 corresponding ledger entries (so those captured features are reconsidered on
 a future run), and writes a JSON audit log of everything it did.
+
+### Auto-configure
+
+```
+python conflate_main.py --auto-configure \
+  https://services.arcgis.com/<org>/arcgis/rest/services/authoritative_water_system/FeatureServer \
+  https://services.arcgis.com/<org>/arcgis/rest/services/collected_water_system/FeatureServer \
+  --default-threshold-m 10.67
+```
+
+Given two feature-**service root URLs** (ending at `FeatureServer`, no
+trailing `/<id>`), enumerates each service's sublayers, matches them by
+sublayer `name` (**case-insensitively** — the AGOL `name` property, not the
+human-readable `title`), and writes a `config.json` layer entry for every
+name that appears once on each side and is a point layer
+(`esriGeometryPoint`) on both. This replaces the hand-bookkeeping of looking
+up each sublayer index and pasting both URLs.
+
+Matching is case-insensitive because AGOL `name` casing varies by org (often
+PascalCase, e.g. `Water_Hydrants`) while hand-written config keys are commonly
+lowercase snake_case (`water_hydrants`) — without it, a re-run would orphan
+existing entries and add duplicates instead of refreshing in place.
+
+Pass the **service root** URLs — `.../FeatureServer`, not
+`.../FeatureServer/0`. If you pass a sublayer URL, the tool errors up front.
+
+It only ever **adds or refreshes** — it never deletes or renames an existing
+key:
+
+- **New** name (no existing key matches case-insensitively) → a fresh entry
+  under the verbatim AGOL `name`, with `field_map: {}` and `copy_attachments`
+  from `--no-copy-attachments` (default `true`). No `type_field_*` keys (add
+  those by hand if a layer needs a type-equality check). `match_threshold_m`
+  is calibrated (see below) unless calibration is off or inconclusive, in
+  which case it falls back to `--default-threshold-m`.
+- **Existing** key matches (case-insensitively), URLs already equal → left
+  untouched, reported as Unchanged. Calibration never runs for these layers —
+  this is what keeps a no-op re-run a true no-op.
+- **Existing** key matches, a URL changed (e.g. a sublayer index shifted) →
+  `authoritative_url`/`captured_url` are refreshed in place under the
+  existing key, and so is `match_threshold_m` **if** calibration produces a
+  confident suggestion for it; `field_map`, `copy_attachments`, and any
+  `type_field_*` pair are always left byte-for-byte as you set them.
+
+#### Threshold calibration
+
+By default, every newly-added or URL-refreshed layer also gets its own
+`match_threshold_m` calibrated instead of stamped with the flat
+`--default-threshold-m` value: the tool fetches both sides' full feature
+sets, computes each captured feature's distance to its nearest
+type-matching authoritative feature (an unbounded search, unlike normal
+matching), and looks for the valley in that distribution — a real dataset is
+typically bimodal, with a tight low-distance cluster of true correspondences
+and a diffuse high-distance tail of features with no real counterpart. If
+the distribution doesn't show a clear valley (too little data, or no real
+separation), a robust `median + 3*MAD` fallback is used and marked
+low-confidence; either way the value is used. Calibration only ever runs for
+new or URL-refreshed layers, never for unchanged ones. A layer whose
+calibration fails outright (network error, missing field after a URL
+change, empty layer) or comes back with too little data to say anything
+falls back to `--default-threshold-m` if it is a genuinely-new layer, or
+keeps its existing `match_threshold_m` if it is a URL-refreshed (changed)
+one — and the run continues: one bad layer never aborts the whole
+`--auto-configure` invocation. The printed summary reports which layers
+were calibrated (with their confidence level), which fell back to the
+default, and which kept their existing threshold, and why.
+
+Pass `--no-calibrate-thresholds` to skip all of this and go back to the old,
+metadata-only behavior: no feature fetch, every newly-added layer gets
+`--default-threshold-m` verbatim, and existing entries' thresholds are never
+touched even on a URL refresh.
+
+Skipped names are reported in the printed summary: non-point or
+geometry-mismatch pairs, names ambiguous (repeated within one/both sides),
+and names present on only one service. `config.json` is git-tracked, so
+`git diff config.json` after a run is the safety net — a no-op re-run against
+the same services produces no diff.
+
+### Calibrate
+
+```
+python conflate_main.py --calibrate --layer hydrants
+python conflate_main.py --calibrate --layer hydrants --apply
+```
+
+Recalibrates a single already-configured layer's `match_threshold_m` on
+demand — the same nearest-neighbor-distance-and-valley logic described above
+under [Threshold calibration](#threshold-calibration), applied to one
+`config.json` entry instead of every layer `--auto-configure` just added.
+Useful once a layer has been live for a while and you want to re-tune its
+threshold from real accumulated data rather than the value it was seeded
+with.
+
+Without `--apply`, only prints the current threshold, the suggestion, and
+diagnostics (sample size, confidence, distance percentiles) — `config.json`
+is never touched. `--apply` writes the suggested value into that one layer's
+`match_threshold_m` (rounded to 2 decimals) and leaves every other field and
+every other layer alone.
+
+Unlike `--auto-configure` (which writes `config.json` unconditionally — the
+git-tracked file is its own safety net when seeding a brand-new entry),
+`--calibrate` requires `--apply` to write anything: it's adjusting a
+threshold on a live, already-running layer that a human may have hand-tuned,
+a different risk profile than seeding a new one. If calibration comes back
+with insufficient data, nothing is written even with `--apply`.
 
 ## Workflow lifecycle
 
