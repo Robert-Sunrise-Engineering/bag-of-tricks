@@ -1,0 +1,28 @@
+{
+  "file_extensions": [".pdf"],
+  "ocr": {
+    "min_chars_for_text_layer": 20,
+    "ocr_dpi": 300,
+    "tesseract_lang": "eng",
+    "tesseract_psm": null,
+    "tesseract_cmd": null
+  },
+  "extraction": {
+    "open_retries": 3,
+    "retry_delay_seconds": 10
+  },
+  "keywords": {
+    "stamp": [
+      "professional engineer",
+      "registered professional engineer",
+      "licensed professional engineer",
+      "p.e.",
+      "pe seal",
+      "engineer's seal",
+      "engineer seal",
+      "registered engineer",
+      "licensed engineer",
+      "certificate of authorization"
+    ]
+  }
+}
