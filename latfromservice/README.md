@@ -183,8 +183,11 @@ populate them in a separate step.
   the geodatabase; a failure aborts both. If the Editor cannot start on a
   `.gdb`, the current version raises an error instead of silently falling back
   to a non-transactional write.
-- If the mains and laterals are in **different workspaces**, the transaction
-  covers only the laterals workspace. The tool warns about this.
+- If the mains and laterals are in **different workspaces** and main vertices are
+  being inserted, a transactional run stops immediately. Rerun with
+  `--no-transaction` only when you can tolerate separate uncoordinated writes;
+  otherwise move one dataset into the other's workspace. Without vertex
+  insertion, the mismatch is only warned about.
 - For a target inside a **feature dataset** (for example a trace-network
   feature dataset), the engine resolves the containing `.gdb` for locking and
   the edit session. This is what allows the tool to write to

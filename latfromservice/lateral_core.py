@@ -273,8 +273,9 @@ def _validate(points_fc, mains_fc, laterals_fc, preview):
             "construction is not valid in geographic coordinates."
             % laterals_desc.spatialReference.name)
 
-    fields = {f.name.upper() for f in arcpy.ListFields(laterals_fc)}
-    if "SHAPE" not in fields:
+    field_names = {f.name.upper() for f in arcpy.ListFields(laterals_fc)}
+    shape_field = arcpy.Describe(laterals_fc).shapeFieldName
+    if shape_field.upper() not in field_names:
         raise arcpy.ExecuteError(
             "The laterals target has no geometry field: %s" % laterals_fc)
 
@@ -983,11 +984,22 @@ def generate_laterals(points_fc, mains_fc, laterals_fc,
 
             laterals_ws = _workspace_of(laterals_fc)
             mains_ws = _workspace_of(mains_fc)
-            if transactional and laterals_ws and mains_ws and \
-                    os.path.normcase(laterals_ws) != os.path.normcase(mains_ws):
+            mixed_workspaces = (
+                bool(laterals_ws) and bool(mains_ws)
+                and os.path.normcase(laterals_ws) != os.path.normcase(mains_ws))
+            if transactional and mixed_workspaces and insert_main_vertices:
+                raise arcpy.ExecuteError(
+                    "Mains and laterals must be in the same workspace for a "
+                    "transactional run, because the vertex write must be rolled "
+                    "back with the lateral write. Run again with "
+                    "--no-transaction (and the edit session closed), or move "
+                    "one of the datasets into the other's workspace: %s vs "
+                    "%s." % (laterals_ws, mains_ws))
+            elif mixed_workspaces:
                 arcpy.AddWarning(
-                    "Mains and laterals are in different workspaces; the "
-                    "transaction covers only the laterals workspace.")
+                    "Mains and laterals are in different workspaces; the write "
+                    "is not fully transactional (%s vs %s)."
+                    % (laterals_ws, mains_ws))
 
             if transactional:
                 plan, inserted, degenerate = _run_in_edit_session(

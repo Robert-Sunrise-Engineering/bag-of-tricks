@@ -144,8 +144,12 @@ def _run_from_cli(argv):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--selftest" in argv:
-        lateral_core.selftest()
-        return 0
+        report_folder = None
+        if "--report-folder" in argv:
+            index = argv.index("--report-folder")
+            if index + 1 < len(argv):
+                report_folder = argv[index + 1]
+        return lateral_core.selftest(report_folder) or 0
     if argv:
         return _run_from_cli(argv)
     return _run_from_gp()
