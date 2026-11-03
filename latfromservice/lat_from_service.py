@@ -1,288 +1,168 @@
 # -*- coding: utf-8 -*-
 """
-lat_from_service.py - Create lateral lines from service points.
+lat_from_service.py - Create lateral lines from water service points.
 
-For each service point, finds the nearest main (line feature class) and inserts
-a straight lateral line into an existing line feature class, running from the
-point to its nearest point on the main (perpendicular to the main segment
-whenever the perpendicular foot falls inside a segment).
+Thin command-line / ArcGIS Pro script-tool wrapper around lateral_core.py. All
+of the work - analysis, main vertex insertion, lateral construction and the
+report - lives in lateral_core.generate_laterals(); this file only reads
+parameters and reports failures.
 
-Points with no main within the max search distance - and points that sit on a
-main (degenerate zero-length laterals) - are skipped and reported, both in the
-geoprocessing messages and in a timestamped text report next to this script.
+For each service point, a two-point lateral is appended to an existing line
+feature class, running from the point to its nearest main. A vertex is inserted
+into the main at the connection so the trace network creates a junction. Points
+that already have a lateral (within the connection tolerance), sit on a main,
+have no main within the maximum search distance, or share a coordinate with
+another service point are skipped and reported.
 
-Parameters (in order, script tool or command line):
-    1. Service points      - point feature class/layer
-    2. Mains               - line feature class/layer (never modified)
-    3. Laterals            - EXISTING line feature class the laterals are appended into
-                             (only SHAPE is written; other fields are left null)
-    4. Max search distance - linear unit, e.g. "150 Feet" (a bare number is
-                             interpreted in the spatial reference's linear units)
-
-Geometry is built in the laterals' spatial reference; the point and line inputs
-are projected into it on temporary copies in the memory workspace when their
-spatial reference differs. The laterals' spatial reference must be projected.
+Parameters (script tool, in order):
+    1. Service points        - point feature class/layer
+    2. Mains                 - line feature class/layer (vertices may be inserted)
+    3. Laterals target       - EXISTING line feature class to append into
+                               (only SHAPE is written; other fields stay null)
+    4. Max search distance   - linear unit, e.g. "100 Feet"
+    5. Connection tolerance  - linear unit, e.g. "1 Foot"
+    6. Skip already connected - boolean ("true"/"false")
+    7. Insert vertices in mains - boolean
+    8. Preview only          - boolean
+    9. Report folder         - folder
 
 Run:
-    ArcGIS Pro script tool (add script, four parameters), or
-    propy lat_from_service.py <points> <mains> <laterals> <max_search_dist>
+    propy lat_from_service.py <points> <mains> <laterals> "100 Feet"
+    propy lat_from_service.py <points> <mains> <laterals> "100 Feet" --preview
+    propy lat_from_service.py <points> <mains> <laterals> -t "1 Foot" --no-vertices
 Self-test (synthetic data, no inputs):
     propy lat_from_service.py --selftest
 """
 
-import os
 import sys
-from datetime import datetime
 
 import arcpy
 
-_MEM_WS = "memory"
-_TMP_PTS = os.path.join(_MEM_WS, "lat_pts_tmp")
-_TMP_PTS_PROJ = os.path.join(_MEM_WS, "lat_pts_proj")
-_TMP_MAINS = os.path.join(_MEM_WS, "lat_mains_proj")
-# Distances at or below this (in spatial-reference units) mean the point sits on a main.
-ON_MAIN_TOL = 1e-6
-_REPORT_EVERY = 250
+import lateral_core
+
+_DEFAULT_MAX_DIST = "100 Feet"
+_DEFAULT_TOLERANCE = "1 Foot"
 
 
-def _sr_key(sr):
-    """Cheap identity for comparing spatial references."""
-    return (getattr(sr, "factoryCode", 0), sr.name)
+def _as_bool(text, default):
+    """Read a boolean from a script-tool text value or a CLI flag."""
+    if text is None:
+        return default
+    value = str(text).strip().lower()
+    if not value:
+        return default
+    if value in ("true", "1", "yes", "y"):
+        return True
+    if value in ("false", "0", "no", "n"):
+        return False
+    return default
 
 
-def _prep_points(points_fc, target_sr):
-    """Return a points path safe for Near: always a copy (Near adds fields), projected if needed."""
-    desc = arcpy.Describe(points_fc)
-    if desc.shapeType != "Point":
-        raise arcpy.ExecuteError(
-            "Service points input must be a point feature class; got %s." % desc.shapeType)
-    if _sr_key(desc.spatialReference) != _sr_key(target_sr):
-        arcpy.management.Project(points_fc, _TMP_PTS_PROJ, target_sr)
-        return _TMP_PTS_PROJ
-    arcpy.management.CopyFeatures(points_fc, _TMP_PTS)
-    return _TMP_PTS
-
-
-def _prep_mains(mains_fc, target_sr):
-    """Return a mains path in target_sr; used read-only, so no copy unless a projection is needed."""
-    desc = arcpy.Describe(mains_fc)
-    if desc.shapeType != "Polyline":
-        raise arcpy.ExecuteError(
-            "Mains input must be a line feature class; got %s." % desc.shapeType)
-    if _sr_key(desc.spatialReference) == _sr_key(target_sr):
-        return mains_fc
-    arcpy.management.Project(mains_fc, _TMP_MAINS, target_sr)
-    return _TMP_MAINS
-
-
-def _polyline(x1, y1, x2, y2, sr):
-    array = arcpy.Array([arcpy.Point(x1, y1), arcpy.Point(x2, y2)])
-    return arcpy.Polyline(array, sr)
-
-
-def generate_laterals(points_fc, mains_fc, laterals_fc, max_search_dist):
-    """Find each point's nearest main and append a lateral line to the laterals target.
-
-    Returns (inserted, too_far_oids, on_main_oids, bad_geom_oids).
-    """
-    target_sr = arcpy.Describe(laterals_fc).spatialReference
-    if target_sr.type != "Projected":
-        raise arcpy.ExecuteError(
-            "The laterals feature class must use a projected coordinate system "
-            "(got %s). Project the data and run again - perpendicular construction "
-            "is not valid in geographic coordinates." % target_sr.name)
-    if arcpy.Describe(laterals_fc).shapeType != "Polyline":
-        raise arcpy.ExecuteError("The laterals target must be a line feature class.")
-
-    pts = _prep_points(points_fc, target_sr)
-    mains = _prep_mains(mains_fc, target_sr)
-
-    arcpy.analysis.Near(pts, mains, max_search_dist, "LOCATION")
-
-    fields = ["OID@", "SHAPE@", "NEAR_FID", "NEAR_DIST", "NEAR_X", "NEAR_Y"]
-    inserted = 0
-    too_far = []
-    on_main = []
-    bad_geom = []
-    total = int(arcpy.management.GetCount(pts)[0])
-    arcpy.SetProgressor("default", "Building laterals for %d service points..." % total)
-
-    with arcpy.da.SearchCursor(pts, fields) as sc, \
-            arcpy.da.InsertCursor(laterals_fc, ["SHAPE@"]) as ic:
-        for i, (oid, geom, near_fid, near_dist, near_x, near_y) in enumerate(sc, start=1):
-            if i % _REPORT_EVERY == 0:
-                arcpy.AddMessage("  %d of %d points processed (%d laterals inserted)"
-                                 % (i, total, inserted))
-            if geom is None:
-                bad_geom.append(oid)
-                continue
-            if near_fid is None or near_fid == -1:
-                too_far.append(oid)
-                continue
-            if near_dist is not None and near_dist <= ON_MAIN_TOL:
-                on_main.append(oid)
-                continue
-            pt = geom.firstPoint
-            if abs(pt.X - near_x) <= ON_MAIN_TOL and abs(pt.Y - near_y) <= ON_MAIN_TOL:
-                on_main.append(oid)
-                continue
-            ic.insertRow([_polyline(pt.X, pt.Y, near_x, near_y, target_sr)])
-            inserted += 1
-
-    arcpy.ResetProgressor()
-    return inserted, too_far, on_main, bad_geom
-
-
-def _cleanup():
-    for tmp in (_TMP_PTS, _TMP_PTS_PROJ, _TMP_MAINS):
-        if arcpy.Exists(tmp):
-            arcpy.management.Delete(tmp)
-
-
-def _write_report(params, inserted, too_far, on_main, bad_geom):
-    """Write a timestamped text report of this run; returns the path, or None if it failed."""
+def _gp_text(index, default=""):
+    """Read an optional script-tool parameter without failing when unset."""
     try:
-        report_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "lateral_report_%s.txt" % datetime.now().strftime("%Y%m%d_%H%M%S"))
-        with open(report_path, "w") as fh:
-            fh.write("lat_from_service report %s\n" % datetime.now().isoformat())
-            fh.write("points=%s\nmains=%s\nlaterals=%s\nmax_search_dist=%s\n"
-                     % params)
-            fh.write("inserted=%d\n" % inserted)
-            fh.write("skipped too_far (%d): %s\n" % (len(too_far), too_far))
-            fh.write("skipped on_main (%d): %s\n" % (len(on_main), on_main))
-            fh.write("skipped bad_geom (%d): %s\n" % (len(bad_geom), bad_geom))
-        return report_path
+        value = arcpy.GetParameterAsText(index)
     except Exception:
-        return None
+        return default
+    if value is None or value == "":
+        return default
+    return value
 
 
-def _report_to_gp(inserted, too_far, on_main, bad_geom, report_path):
-    arcpy.AddMessage("Laterals inserted: %d" % inserted)
-    if too_far:
-        arcpy.AddWarning(
-            "Skipped %d point(s) with no main within the max search distance (OID%s): %s"
-            % (len(too_far), "" if len(too_far) == 1 else "s", too_far))
-    if on_main:
-        arcpy.AddWarning(
-            "Skipped %d point(s) located on a main - zero-length lateral (OID%s): %s"
-            % (len(on_main), "" if len(on_main) == 1 else "s", on_main))
-    if bad_geom:
-        arcpy.AddWarning(
-            "Skipped %d point(s) with null geometry (OID%s): %s"
-            % (len(bad_geom), "" if len(bad_geom) == 1 else "s", bad_geom))
-    if report_path:
-        arcpy.AddMessage("Report written to: %s" % report_path)
+def _run_from_gp():
+    """Parameter values supplied by the ArcGIS Pro script tool."""
+    required = [_gp_text(index) for index in range(4)]
+    if not all(required):
+        raise arcpy.ExecuteError(
+            "Service points, mains, laterals target and maximum search distance "
+            "are required.")
+    points, mains, laterals, max_search_dist = required
+
+    lateral_core.generate_laterals(
+        points, mains, laterals,
+        max_search_dist=max_search_dist,
+        connection_tolerance=_gp_text(4, _DEFAULT_TOLERANCE),
+        skip_connected=_as_bool(_gp_text(5, "true"), True),
+        insert_main_vertices=_as_bool(_gp_text(6, "true"), True),
+        preview=_as_bool(_gp_text(7, "false"), False),
+        report_folder=_gp_text(8, None) or None,
+        transactional=True)
+    return 0
 
 
-def _selftest():
-    """Synthetic end-to-end check against a scratch memory geodatabase."""
-    sr = arcpy.SpatialReference(26911)  # NAD83 / UTM zone 11N, meters
+def _run_from_cli(argv):
+    """Command-line parameters (also used by propy)."""
+    import argparse
 
-    def make_fc(name, geom_type):
-        path = os.path.join(_MEM_WS, name)
-        if arcpy.Exists(path):
-            arcpy.management.Delete(path)
-        arcpy.management.CreateFeatureclass(_MEM_WS, name, geom_type,
-                                            None, None, None, sr)
-        return path
-    try:
-        mains = make_fc("st_mains", "Polyline")
-        points = make_fc("st_points", "Point")
-        laterals = make_fc("st_laterals", "Polyline")
+    parser = argparse.ArgumentParser(
+        description="Append a lateral from each service point to its nearest "
+                    "main, inserting a vertex into the main at each connection.")
+    parser.add_argument("points", help="service point feature class")
+    parser.add_argument("mains", help="main line feature class")
+    parser.add_argument("laterals", help="existing line feature class to append into")
+    parser.add_argument("max_search_dist", nargs="?",
+                        default=_DEFAULT_MAX_DIST,
+                        help='maximum search distance, e.g. "100 Feet" (default)')
+    parser.add_argument("-t", "--tolerance", dest="connection_tolerance",
+                        default=_DEFAULT_TOLERANCE,
+                        help='connection tolerance, e.g. "1 Foot" (default)')
+    parser.add_argument("--no-skip-connected", dest="skip_connected",
+                        action="store_false",
+                        help="do not skip points that already have a lateral "
+                             "(duplicates laterals - leave off)")
+    parser.add_argument("--no-vertices", dest="insert_main_vertices",
+                        action="store_false",
+                        help="do not insert vertices into the mains")
+    parser.add_argument("--preview", action="store_true",
+                        help="analyze and report only; make no geodatabase writes")
+    parser.add_argument("--report-folder", default=None,
+                        help="folder for the timestamped report "
+                             "(default: the scratch folder)")
+    parser.add_argument("--no-transaction", dest="transactional",
+                        action="store_false",
+                        help="do not wrap the writes in an edit-session transaction")
+    parser.add_argument("--selftest", action="store_true",
+                        help="run synthetic checks and exit")
 
-        with arcpy.da.InsertCursor(mains, ["SHAPE@"]) as ic:
-            # Main A: straight line along y = 0
-            ic.insertRow([arcpy.Polyline(
-                arcpy.Array([arcpy.Point(0, 0), arcpy.Point(1000, 0)]), sr)])
-            # Main B: straight line along x = 1000
-            ic.insertRow([arcpy.Polyline(
-                arcpy.Array([arcpy.Point(1000, 0), arcpy.Point(1000, 1000)]), sr)])
+    args = parser.parse_args(argv)
+    if args.selftest:
+        lateral_core.selftest(args.report_folder)
+        return 0
 
-        with arcpy.da.InsertCursor(points, ["SHAPE@"]) as ic:
-            ic.insertRow([arcpy.Point(500, 100)])    # interior foot on A -> lateral
-            ic.insertRow([arcpy.Point(1500, 100)])   # interior foot on B -> lateral
-            ic.insertRow([arcpy.Point(500, 5000)])   # far from everything -> skip
-            ic.insertRow([arcpy.Point(200, 0)])      # sits on A -> skip
-
-        inserted, too_far, on_main, bad_geom = generate_laterals(
-            points, mains, laterals, "2000 Meters")
-
-        assert inserted == 2, "expected 2 laterals, got %d" % inserted
-        assert too_far == [3], "too_far should be [OID 3], got %s" % too_far
-        assert on_main == [4], "on_main should be [OID 4], got %s" % on_main
-        assert bad_geom == [], "bad_geom should be empty, got %s" % bad_geom
-
-        actual = []
-        with arcpy.da.SearchCursor(laterals, ["SHAPE@"]) as sc:
-            for (line,) in sc:
-                pts = [(p.X, p.Y) for p in line.getPart(0)]
-                actual.append(pts)
-        expected = [[(500, 100), (500, 0)], [(1500, 100), (1000, 100)]]
-        for got, want in zip(actual, expected):
-            for (gx, gy), (wx, wy) in zip(got, want):
-                assert abs(gx - wx) < 1e-9 and abs(gy - wy) < 1e-9, \
-                    "lateral endpoint mismatch: %s vs %s" % (got, want)
-
-        # Perpendicularity: lateral direction vs its main's direction must have ~zero dot product
-        later1 = actual[0]
-        dot = ((later1[1][0] - later1[0][0]) * 1.0
-               + (later1[1][1] - later1[0][1]) * 0.0)  # main A direction = (1, 0)
-        assert abs(dot) < 1e-9, "lateral 1 not perpendicular to main A (dot=%s)" % dot
-        later2 = actual[1]
-        dot = ((later2[1][0] - later2[0][0]) * 0.0  # main B direction = (0, 1)
-               + (later2[1][1] - later2[0][1]) * 1.0)
-        assert abs(dot) < 1e-9, "lateral 2 not perpendicular to main B (dot=%s)" % dot
-        for pts_ in actual:
-            assert len(pts_) == 2, "laterals must be 2-point lines, got %s" % pts_
-
-        print("SELFTEST PASSED (%d laterals; skips: %s)" % (inserted, (too_far, on_main)))
-    finally:
-        _cleanup()
+    lateral_core.generate_laterals(
+        args.points, args.mains, args.laterals,
+        max_search_dist=args.max_search_dist,
+        connection_tolerance=args.connection_tolerance,
+        skip_connected=args.skip_connected,
+        insert_main_vertices=args.insert_main_vertices,
+        preview=args.preview,
+        report_folder=args.report_folder,
+        transactional=args.transactional)
+    return 0
 
 
-def _get_params(n=4):
-    """Parameter values from the script tool, or from sys.argv when run standalone."""
-    values = []
-    try:
-        values = [arcpy.GetParameterAsText(i) for i in range(n)]
-        if all(values):
-            return values
-    except Exception:
-        pass
-    argv = sys.argv[1:]
-    if len(argv) >= n:
-        return argv[:n]
-    if len(values) == n:
-        return values
-    raise arcpy.ExecuteError(
-        "Expected %d parameters (service points, mains, laterals target, "
-        "max search distance), got fewer." % n)
-
-
-def main():
-    if "--selftest" in sys.argv:
-        _selftest()
-        return
-    points_fc, mains_fc, laterals_fc, max_search_dist = _get_params()
-    try:
-        inserted, too_far, on_main, bad_geom = generate_laterals(
-            points_fc, mains_fc, laterals_fc, max_search_dist)
-        params = (points_fc, mains_fc, laterals_fc, max_search_dist)
-        report_path = _write_report(params, inserted, too_far, on_main, bad_geom)
-        _report_to_gp(inserted, too_far, on_main, bad_geom, report_path)
-    finally:
-        _cleanup()
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--selftest" in argv:
+        report_folder = None
+        if "--report-folder" in argv:
+            index = argv.index("--report-folder")
+            if index + 1 < len(argv):
+                report_folder = argv[index + 1]
+        return lateral_core.selftest(report_folder) or 0
+    if argv:
+        return _run_from_cli(argv)
+    return _run_from_gp()
 
 
 if __name__ == "__main__":
     try:
-        main()
-        sys.exit(0)
+        sys.exit(main())
     except arcpy.ExecuteError as err:
         arcpy.AddError(str(err))
+        print(str(err), file=sys.stderr)
         sys.exit(1)
-    except Exception as err:
+    except Exception as err:      # noqa: BLE001 - report anything unexpected
         arcpy.AddError("Unexpected failure: %r" % err)
+        print("Unexpected failure: %r" % err, file=sys.stderr)
         sys.exit(1)
