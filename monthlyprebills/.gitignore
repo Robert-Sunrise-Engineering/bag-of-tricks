@@ -1,0 +1,13 @@
+# Real client financial documents and anything extracted from them.
+newprebills/
+reports/
+config.local.json
+
+# Client-specific planning and validation records (kept local, never committed).
+PLAN.md
+docs/2026-11-10-prebills-design.md
+
+# Scratch / logs
+*.log
+.scratch/
+.audit/

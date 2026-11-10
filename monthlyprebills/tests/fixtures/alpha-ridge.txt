@@ -1,0 +1,39 @@
+                                                                      Pre-billing summary
+
+Billing schedule Id   :BSCHD000000101                              Legal entity  :Example Engineering LLC
+
+Contract number       :T10001                                       From date     :
+
+Contract name         :Alpha Ridge Cloud  To date       :10/31/2026
+
+                      Services
+
+Progress summary
+
+Phase/Task                                   Project Group Contract Value        Previously  Previously     JTD  Spent at  Earned     Earned    % To     Current  Billing
+
+                                                                                 Invoiced    Invoiced %          Billing   Revenue %  Revenue   Invoice
+
+                                                                                                                           Complete
+
+T10001_001 | Alpha Ridge Cloud Services
+
+T10001_001.001.001 | Admin                  Progress              437.19        437.19       100.00%            318.42    100.00%    437.19    100.00%           0.00
+
+Sample Invoice A-0001 - $437
+
+T10001_001.001.002 | Admin                  Progress              437.19        437.19       100.00%              0.00     46.13%    201.68    100.00%           0.00
+
+Widget Support - $437 due Mar 2031
+
+T10001_001.001.003 | Admin                  Progress              437.19          0.00         0.00%              0.00      0.00%      0.00      0.00%             0.00
+
+Widget Support - $437 due Mar 2032
+
+T10001_001.002.001 | Multi-             Time   and expense            0.00          84.37        0.00%             84.37     0.00%     84.37     0.00%             0.00
+
+Tenant Widget Support
+
+                                                               1,311.57          958.75                        402.79               723.24                    0.00
+
+Transactions summary

@@ -1,0 +1,29 @@
+                                                                      Pre-billing summary
+
+Billing schedule Id   :BSCHD000000103                              Legal entity  :Example Engineering LLC
+
+Contract number       :T30003                                       From date     :
+
+Contract name         :Gamma Field Services        To date       :10/31/2026
+
+Progress summary
+
+Phase/Task                                   Project Group Contract Value        Previously  Previously     JTD  Spent at  Earned     Earned    % To     Current  Billing
+
+                                                                                 Invoiced    Invoiced %          Billing   Revenue %  Revenue   Invoice
+
+                                                                                                                           Complete
+
+T30003 | Gamma Field Services
+
+T30003.001.001 | Admin                         Progress       512.30              0.00         0.00%         0.00      0.00%      0.00     0.00%             0.00
+
+Widget Support - $512 due Sep 2034
+
+T30003.002.001 | Multi-             Time   and expense           0.00                0.00         0.00%         0.00      0.00%      0.00     0.00%             0.00
+
+Tenant Widget Support
+
+                                                                    512.30              0.00                       0.00                 0.00                       0.00
+
+Transactions summary

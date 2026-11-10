@@ -1,0 +1,47 @@
+                                                                      Pre-billing summary
+
+Billing schedule Id   :BSCHD000000102                              Legal entity  :Example Engineering LLC
+
+Contract number       :T20002                                       From date     :
+
+Contract name         :Beta Harbor Cloud Services        To date       :10/31/2026
+
+Progress summary
+
+Phase/Task                                   Project Group Contract Value        Previously  Previously     JTD  Spent at  Earned     Earned    % To     Current  Billing
+
+                                                                                 Invoiced    Invoiced %          Billing   Revenue %  Revenue   Invoice
+
+                                                                                                                           Complete
+
+T20002 | Beta Harbor Cloud Services
+
+T20002.0002.006 | On-Site           Time and expense            0.00            862.40          0.00%        1,347.90          0.00%     862.40      0.00%             0.00
+
+Widget Support
+
+T20002.0003 | 0003 Indigo          Time and expense            0.00              0.00          0.00%          0.00            0.00%           0.00  0.00%             0.00
+
+Sample Widget Subscription
+
+Service
+
+T20002.0004.001 | Admin                   Progress              623.47        623.47           100.00%         0.00           100.00%       623.47   100.00%           0.00
+
+Widget Support - $619 due Jun 2031
+
+T20002.0004.003 | Admin                   Progress              623.47        623.47           100.00%         0.00            82.35%       509.62   100.00%           0.00
+
+Widget Support - $619 due Jun 2032
+
+T20002.0004.004 | Admin                   Progress              623.47            0.00          0.00%          0.00            0.00%           0.00  0.00%             0.00
+
+Widget Support - $619 due Jun 2033
+
+T20002.0005.001 | On-Site           Time and expense           0.00              0.00          0.00%          0.00            0.00%           0.00  0.00%             0.00
+
+Widget Support
+
+                                                                   1,870.41      2,109.34                       1,347.90                  1,995.49                        0.00
+
+Transactions summary

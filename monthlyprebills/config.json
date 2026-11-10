@@ -1,0 +1,6 @@
+{
+  "inputPath": "newprebills",
+  "outputPath": "reports",
+  "threshold": 0.01,
+  "pdfToTextPath": ""
+}
